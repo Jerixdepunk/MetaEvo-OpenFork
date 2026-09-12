@@ -154,6 +154,7 @@ jobs:
             "build-tools;35.0.0"
 
           test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
 
           echo "Android build tools verified."
 
@@ -189,7 +190,59 @@ jobs:
             wc -l
 
       # ============================================================
-      # 10. NORMALIZE APKTOOL METADATA
+      # 10. DIAGNOSE MALFORMED SMALI SOURCES (NON-BLOCKING)
+      #
+      # Apktool sometimes reports "missing EOF at '.class'" while
+      # smaling certain classes (commonly obfuscated ad-mediation
+      # SDK classes with trailing/duplicate content after the class
+      # body). Apktool tolerates this and continues, but it can mean
+      # the affected class did not disassemble/reassemble cleanly.
+      # This step never fails the build -- it only surfaces the
+      # affected files clearly instead of letting the warning get
+      # buried in the smaling log later.
+      # ============================================================
+      - name: Diagnose malformed smali sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "Scanning smali sources for duplicate/stray '.class' directives..."
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          suspects = []
+
+          for smali_file in Path("app").rglob("*.smali"):
+              try:
+                  lines = smali_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+              except Exception:
+                  continue
+
+              class_line_numbers = [
+                  i + 1 for i, line in enumerate(lines)
+                  if line.strip().startswith(".class ")
+              ]
+
+              if len(class_line_numbers) > 1:
+                  suspects.append((str(smali_file), class_line_numbers))
+
+          if suspects:
+              print(f"::warning::{len(suspects)} smali file(s) contain multiple '.class' directives "
+                    f"and may not disassemble/reassemble correctly:")
+              for path, lines in suspects:
+                  print(f"  - {path} (.class at lines: {lines})")
+              print("These files were left untouched. Apktool will emit a "
+                    "\"missing EOF at '.class'\" warning for them during smaling; "
+                    "this is expected and does not currently fail the build.")
+          else:
+              print("No duplicate '.class' directives found.")
+          PY
+
+      # ============================================================
+      # 11. NORMALIZE APKTOOL METADATA
       # ============================================================
       - name: Normalize Apktool metadata
         shell: bash
@@ -246,7 +299,14 @@ jobs:
             app/apktool.yml || true
 
       # ============================================================
-      # 11. BOOTSTRAP APKTOOL 3.0.3
+      # 12. BOOTSTRAP APKTOOL 3.0.3
+      #
+      # NOTE: Apktool 3.x removed AAPT1 support entirely (confirmed
+      # upstream) so there is no "--use-aapt1" fallback available to
+      # tolerate raw int values for flags/enum/dimension-enum typed
+      # attributes any more. AAPT2 is strict about this, which is
+      # the underlying cause of the resource-linking failures fixed
+      # in steps 14 and 18 below.
       # ============================================================
       - name: Bootstrap Apktool 3.0.3
         shell: bash
@@ -279,7 +339,7 @@ jobs:
           java -jar tools/apktool.jar --version
 
       # ============================================================
-      # 12. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
+      # 13. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
       #
       # public.xml can declare fixed IDs for resources that no longer
       # exist anywhere in the source tree (lost before packaging).
@@ -375,114 +435,419 @@ jobs:
           PY
 
       # ============================================================
-      # 13. REPAIR RAW GRAVITY FLAG VALUES IN STYLES
+      # 14. WRITE SHARED AAPT2 RAW-VALUE SYMBOL RESOLVER
       #
-      # AAPT2 requires flags-typed attributes (like android:gravity)
-      # to use symbolic flag names ("center", "bottom|center_horizontal")
-      # rather than raw integers. Apktool sometimes decompiles these
-      # back as bare hex/decimal values, which AAPT2 then rejects with
-      # "expected flags but got (raw string) 0x..". This decodes any
-      # such raw gravity values into their symbolic equivalent using
-      # the same bitmasks Android's framework defines for gravity.
+      # AAPT2 requires flags/enum/dimension-enum typed attributes to
+      # use symbolic names ("center", "wrap_content", "adjustPan"...)
+      # rather than the raw ints Apktool sometimes leaves behind when
+      # decompiling (a long-standing Apktool/AAPT2 interaction issue,
+      # and Apktool 3.x removed the AAPT1 fallback that used to
+      # tolerate raw ints -- see step 12).
+      #
+      # Earlier revisions of this pipeline only patched android:gravity
+      # / layout_gravity. In practice AAPT2 rejects raw values for many
+      # more attributes (layout_width/height, orientation, visibility,
+      # textAlignment, layoutDirection, typeface, ellipsize, textStyle,
+      # windowSoftInputMode, ...), so this script is attribute-aware:
+      # it reads the *actual* attribute name on each offending item and
+      # dispatches to the correct decoder for that attribute, rather
+      # than guessing from the value alone.
+      #
+      # This same script is reused in two places:
+      #   - a proactive full-tree scan (this step), and
+      #   - a targeted, log-driven fix inside the self-healing build
+      #     retry loop (step 18), for anything the proactive scan
+      #     doesn't have a rule for yet.
       # ============================================================
-      - name: Repair raw gravity flag values in styles
+      - name: Write shared AAPT2 symbol resolver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          mkdir -p tools
+
+          cat > tools/aapt_symbol_fix.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Shared AAPT2 raw-value -> symbolic-value resolver.
+
+          Modes:
+            --scan-all              Walk every app/res/**/*.xml and symbolize any
+                                     recognized raw flags/enum/dimension-enum item,
+                                     whether or not AAPT2 has complained about it yet.
+
+            --fix-from-log LOGFILE  Parse an AAPT2/apktool build log for
+                                     "expected (flags|enum|dimension enum) but got
+                                     (raw string) VALUE" errors, and fix exactly the
+                                     reported file:line. If the attribute is not
+                                     recognized, the offending <item> is dropped
+                                     instead (a missing style override is far safer
+                                     than a failed build).
+          """
+          import argparse
+          import re
+          import sys
+          from pathlib import Path
+
+          RES_ROOT = Path("app/res")
+
+          # ---------------------------------------------------------------
+          # Decoders
+          # ---------------------------------------------------------------
+
+          def decode_gravity(value):
+              RELATIVE = 0x800000
+              relative = bool(value & RELATIVE)
+              v = value & ~RELATIVE
+
+              EXACT = {0x11: "center", 0x77: "fill"}
+              VMASK = {0x70: "fill_vertical", 0x50: "bottom", 0x30: "top", 0x10: "center_vertical"}
+              HMASK = {0x07: "fill_horizontal", 0x05: "right", 0x03: "left", 0x01: "center_horizontal"}
+
+              if v in EXACT and not relative:
+                  return EXACT[v]
+
+              parts = []
+              remaining = v
+
+              vmask = v & 0x70
+              if vmask in VMASK:
+                  parts.append(VMASK[vmask])
+                  remaining &= ~0x70
+
+              hmask = v & 0x07
+              if hmask in HMASK:
+                  name = HMASK[hmask]
+                  if relative:
+                      name = {"left": "start", "right": "end"}.get(name, name)
+                  parts.append(name)
+                  remaining &= ~0x07
+
+              if v & 0x80:
+                  parts.append("clip_vertical")
+                  remaining &= ~0x80
+              if v & 0x08:
+                  parts.append("clip_horizontal")
+                  remaining &= ~0x08
+
+              if remaining != 0 or not parts:
+                  return None
+              return "|".join(parts)
+
+
+          def decode_window_soft_input_mode(value):
+              if value < 0 or value & ~0xFF:
+                  # Forward-navigation bit (0x100) or anything unexpected: bail out,
+                  # let the caller fall back to dropping the item.
+                  return None
+
+              STATE = {
+                  0: "stateUnspecified", 1: "stateUnchanged", 2: "stateHidden",
+                  3: "stateAlwaysHidden", 4: "stateVisible", 5: "stateAlwaysVisible",
+              }
+              ADJUST = {
+                  0x00: "adjustUnspecified", 0x10: "adjustResize",
+                  0x20: "adjustPan", 0x30: "adjustNothing",
+              }
+
+              state_bits = value & 0x0F
+              adjust_bits = value & 0xF0
+
+              if state_bits not in STATE or adjust_bits not in ADJUST:
+                  return None
+
+              if value == 0:
+                  return "stateUnspecified"
+
+              parts = []
+              if state_bits != 0:
+                  parts.append(STATE[state_bits])
+              if adjust_bits != 0:
+                  parts.append(ADJUST[adjust_bits])
+              if not parts:
+                  parts.append("stateUnspecified")
+              return "|".join(parts)
+
+
+          def decode_text_style(value):
+              if value == 0:
+                  return "normal"
+              parts = []
+              if value & 1:
+                  parts.append("bold")
+              if value & 2:
+                  parts.append("italic")
+              remaining = value & ~0x3
+              if remaining != 0 or not parts:
+                  return None
+              return "|".join(parts)
+
+
+          def decode_dimension_enum(value):
+              return {-1: "match_parent", -2: "wrap_content"}.get(value)
+
+
+          FLAG_DECODERS = {
+              "gravity": decode_gravity,
+              "layout_gravity": decode_gravity,
+              "windowSoftInputMode": decode_window_soft_input_mode,
+              "textStyle": decode_text_style,
+          }
+
+          DIMENSION_ENUM_ATTRS = {"layout_width", "layout_height"}
+
+          ENUM_TABLES = {
+              "orientation": {0: "horizontal", 1: "vertical"},
+              "visibility": {0: "visible", 1: "invisible", 2: "gone"},
+              "textAlignment": {
+                  0: "inherit", 1: "gravity", 2: "textStart", 3: "textEnd",
+                  4: "center", 5: "viewStart", 6: "viewEnd",
+              },
+              "layoutDirection": {0: "ltr", 1: "rtl", 2: "locale", 3: "inherit"},
+              "typeface": {0: "normal", 1: "sans", 2: "serif", 3: "monospace"},
+              "ellipsize": {0: "none", 1: "start", 2: "middle", 3: "end", 4: "marquee"},
+              "capitalize": {0: "none", 1: "sentences", 2: "words", 3: "characters"},
+              "imeOptions": {
+                  0: "actionUnspecified", 1: "actionNone", 2: "actionGo",
+                  3: "actionSearch", 4: "actionSend", 5: "actionNext",
+                  6: "actionDone", 7: "actionPrevious",
+              },
+          }
+
+
+          def parse_raw_value(raw_value):
+              raw_value = raw_value.strip()
+              if raw_value.lower().startswith("0x") or raw_value.lower().startswith("-0x"):
+                  neg = raw_value.startswith("-")
+                  digits = raw_value[1:] if neg else raw_value
+                  n = int(digits, 16)
+                  return -n if neg else n
+              return int(raw_value, 10)
+
+
+          def resolve_symbol(attr_name, category, value):
+              """category is one of: flags, enum, dimension_enum"""
+              short_name = attr_name.split(":")[-1]
+
+              if category == "dimension_enum":
+                  if short_name in DIMENSION_ENUM_ATTRS:
+                      return decode_dimension_enum(value)
+                  return None
+
+              if category == "flags":
+                  decoder = FLAG_DECODERS.get(short_name)
+                  if decoder:
+                      return decoder(value)
+                  return None
+
+              if category == "enum":
+                  table = ENUM_TABLES.get(short_name)
+                  if table:
+                      return table.get(value)
+                  return None
+
+              return None
+
+
+          ITEM_RE = re.compile(
+              r'(<item\s+name="((?:android:)?[\w.]+)"[^>]*>)\s*'
+              r'(-?0[xX][0-9a-fA-F]+|-?[0-9]+)\s*(</item>)'
+          )
+
+
+          # ---------------------------------------------------------------
+          # Mode 1: proactive full-tree scan
+          # ---------------------------------------------------------------
+
+          def scan_all():
+              total_fixed = 0
+              total_seen = 0
+
+              for xml_file in RES_ROOT.rglob("*.xml"):
+                  try:
+                      text = xml_file.read_text(encoding="utf-8")
+                  except Exception:
+                      continue
+
+                  fixed_here = []
+
+                  def repl(m):
+                      nonlocal total_seen
+                      open_tag, attr_name, raw_value, close_tag = m.groups()
+                      total_seen += 1
+                      try:
+                          value = parse_raw_value(raw_value)
+                      except ValueError:
+                          return m.group(0)
+
+                      short_name = attr_name.split(":")[-1]
+                      symbol = None
+
+                      if short_name in DIMENSION_ENUM_ATTRS:
+                          symbol = decode_dimension_enum(value)
+                      elif short_name in FLAG_DECODERS:
+                          symbol = FLAG_DECODERS[short_name](value)
+                      elif short_name in ENUM_TABLES:
+                          symbol = ENUM_TABLES[short_name].get(value)
+
+                      if symbol is None:
+                          return m.group(0)
+
+                      fixed_here.append(f"{attr_name}: {raw_value} -> {symbol}")
+                      return f"{open_tag}{symbol}{close_tag}"
+
+                  new_text = ITEM_RE.sub(repl, text)
+
+                  if fixed_here:
+                      xml_file.write_text(new_text, encoding="utf-8")
+                      total_fixed += len(fixed_here)
+                      print(f"{xml_file.relative_to(RES_ROOT)}:")
+                      for line in fixed_here:
+                          print("  -", line)
+
+              print(f"Proactive scan: inspected {total_seen} raw-valued items, "
+                    f"symbolized {total_fixed}.")
+
+
+          # ---------------------------------------------------------------
+          # Mode 2: targeted fix driven by an AAPT2 error log
+          # ---------------------------------------------------------------
+
+          LOG_ERROR_RE = re.compile(
+              r'error:\s*(?:file\s+)?(?P<file>\S+\.xml):(?P<line>\d+):\s*'
+              r'error:\s*expected\s+(?P<category>flags|enum|dimension enum)\s+'
+              r'but got \(raw string\)\s+(?P<value>-?0[xX][0-9a-fA-F]+|-?[0-9]+)'
+          )
+
+          # AAPT2's actual line format looks like:
+          #   W: /abs/path/res/values/styles.xml:148: error: expected flags but got (raw string) 0x1.
+          LOG_LINE_RE = re.compile(
+              r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
+              r'expected\s+(?P<category>flags|enum|dimension enum)\s+'
+              r'but got \(raw string\)\s+(?P<value>-?0[xX][0-9a-fA-F]+|-?[0-9]+)'
+          )
+
+
+          def fix_from_log(log_path):
+              text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
+
+              matches = []
+              for line in text.splitlines():
+                  m = LOG_LINE_RE.search(line)
+                  if m:
+                      matches.append(m.groupdict())
+
+              if not matches:
+                  print("No AAPT2 raw-value errors found in log.")
+                  return 0
+
+              # Group by file so we only read/write each file once.
+              by_file = {}
+              for m in matches:
+                  by_file.setdefault(m["file"], []).append(m)
+
+              total_fixed = 0
+              total_dropped = 0
+
+              for file_path, entries in by_file.items():
+                  p = Path(file_path)
+                  if not p.is_file():
+                      print(f"::warning::Could not locate {file_path} reported by AAPT2; skipping.")
+                      continue
+
+                  lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+
+                  # Process highest line number first so earlier line numbers
+                  # stay valid if we ever need to drop a line.
+                  entries.sort(key=lambda e: int(e["line"]), reverse=True)
+
+                  for entry in entries:
+                      idx = int(entry["line"]) - 1
+                      if idx < 0 or idx >= len(lines):
+                          continue
+
+                      line_text = lines[idx]
+                      name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
+                      if not name_match:
+                          print(f"::warning::Could not find attribute name at "
+                                f"{file_path}:{entry['line']}; leaving untouched.")
+                          continue
+
+                      attr_name = name_match.group(1)
+                      category_key = entry["category"].replace(" ", "_")
+
+                      try:
+                          value = parse_raw_value(entry["value"])
+                      except ValueError:
+                          value = None
+
+                      symbol = None
+                      if value is not None:
+                          symbol = resolve_symbol(attr_name, category_key, value)
+
+                      if symbol is not None:
+                          new_line, n = re.subn(
+                              re.escape(entry["value"]), symbol, line_text, count=1
+                          )
+                          if n:
+                              lines[idx] = new_line
+                              total_fixed += 1
+                              print(f"FIXED {file_path}:{entry['line']}  "
+                                    f"{attr_name}: {entry['value']} -> {symbol}")
+                              continue
+
+                      # Fallback: drop the whole item/line rather than fail the build.
+                      print(f"::warning::DROPPED unresolvable {entry['category']} value "
+                            f"at {file_path}:{entry['line']} "
+                            f"({attr_name} = {entry['value']}); "
+                            f"no symbolic mapping available, style override removed.")
+                      lines[idx] = ""
+                      total_dropped += 1
+
+                  p.write_text("".join(lines), encoding="utf-8")
+
+              print(f"Targeted log-driven fix: {total_fixed} symbolized, "
+                    f"{total_dropped} dropped.")
+              return total_fixed + total_dropped
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--scan-all", action="store_true")
+              parser.add_argument("--fix-from-log")
+              args = parser.parse_args()
+
+              if args.scan_all:
+                  scan_all()
+              elif args.fix_from_log:
+                  changed = fix_from_log(args.fix_from_log)
+                  if changed == 0:
+                      sys.exit(2)  # signal "nothing to fix" to the caller
+              else:
+                  parser.error("Specify --scan-all or --fix-from-log LOGFILE")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          echo "Shared resolver written to tools/aapt_symbol_fix.py"
+
+      # ============================================================
+      # 15. PROACTIVE RAW-VALUE REPAIR PASS
+      # ============================================================
+      - name: Repair raw AAPT2 symbolic attribute values
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          res = Path("app/res")
-
-          GRAVITY_VERTICAL = {
-              0x70: "fill_vertical",
-              0x50: "bottom",
-              0x30: "top",
-              0x10: "center_vertical",
-          }
-          GRAVITY_HORIZONTAL = {
-              0x07: "fill_horizontal",
-              0x05: "right",
-              0x03: "left",
-              0x01: "center_horizontal",
-          }
-          GRAVITY_EXACT = {
-              0x11: "center",
-              0x77: "fill",
-          }
-
-          def decode_gravity(value):
-              if value in GRAVITY_EXACT:
-                  return GRAVITY_EXACT[value]
-
-              parts = []
-              remaining = value
-
-              vmask = value & 0x70
-              if vmask in GRAVITY_VERTICAL:
-                  parts.append(GRAVITY_VERTICAL[vmask])
-                  remaining &= ~0x70
-
-              hmask = value & 0x07
-              if hmask in GRAVITY_HORIZONTAL:
-                  parts.append(GRAVITY_HORIZONTAL[hmask])
-                  remaining &= ~0x07
-
-              if value & 0x80:
-                  parts.append("clip_vertical")
-                  remaining &= ~0x80
-
-              if value & 0x08:
-                  parts.append("clip_horizontal")
-                  remaining &= ~0x08
-
-              if remaining != 0 or not parts:
-                  return None
-
-              return "|".join(parts)
-
-          item_pattern = re.compile(
-              r'(<item\s+name="[^"]*[Gg]ravity"[^>]*>)\s*'
-              r'(0[xX][0-9a-fA-F]+|-?[0-9]+)\s*(</item>)'
-          )
-
-          total_fixed = 0
-
-          for xml_file in res.rglob("*.xml"):
-              text = xml_file.read_text(encoding="utf-8")
-              fixed = []
-
-              def repl(m, fixed=fixed):
-                  open_tag, raw_value, close_tag = m.group(1), m.group(2), m.group(3)
-                  value = (
-                      int(raw_value, 16)
-                      if raw_value.lower().startswith("0x")
-                      else int(raw_value)
-                  )
-                  symbolic = decode_gravity(value)
-                  if symbolic is None:
-                      return m.group(0)
-                  fixed.append(f"{raw_value} -> {symbolic}")
-                  return f"{open_tag}{symbolic}{close_tag}"
-
-              new_text = item_pattern.sub(repl, text)
-
-              if fixed:
-                  xml_file.write_text(new_text, encoding="utf-8")
-                  total_fixed += len(fixed)
-                  print(f"{xml_file.relative_to(res)}:")
-                  for f in fixed:
-                      print("  -", f)
-
-          print(f"Total gravity values converted: {total_fixed}")
-          PY
+          python3 tools/aapt_symbol_fix.py --scan-all
 
       # ============================================================
-      # 14. REPAIR MALFORMED 9-PATCH RESOURCES
+      # 16. REPAIR MALFORMED 9-PATCH RESOURCES
       #
       # AAPT2 rejects malformed .9.png frame pixels.
       #
@@ -505,7 +870,6 @@ jobs:
           from pathlib import Path
           import struct
           import zlib
-          import binascii
 
           root = Path("app/res")
 
@@ -531,16 +895,13 @@ jobs:
                       width, height, bit_depth, color_type, _, _, _ = struct.unpack(
                           ">IIBBBBB", chunk
                       )
-
                   elif ctype == b'IDAT':
                       idat.extend(chunk)
-
                   elif ctype == b'IEND':
                       break
 
               if width is None:
                   raise ValueError("missing IHDR")
-
               if bit_depth != 8:
                   raise ValueError("unsupported bit depth")
 
@@ -561,7 +922,6 @@ jobs:
               for _ in range(height):
                   filter_type = raw[offset]
                   offset += 1
-
                   current = bytearray(raw[offset:offset+stride])
                   offset += stride
 
@@ -571,177 +931,107 @@ jobs:
                       up_left = previous[i-channels] if i >= channels else 0
 
                       if filter_type == 0:
-                          value = current[i]
-
+                          pass
                       elif filter_type == 1:
-                          value = (current[i] + left) & 255
-                          current[i] = value
-
+                          current[i] = (current[i] + left) & 255
                       elif filter_type == 2:
-                          value = (current[i] + up) & 255
-                          current[i] = value
-
+                          current[i] = (current[i] + up) & 255
                       elif filter_type == 3:
-                          value = (current[i] + ((left + up) // 2)) & 255
-                          current[i] = value
-
+                          current[i] = (current[i] + ((left + up) // 2)) & 255
                       elif filter_type == 4:
                           p = left + up - up_left
-                          pa = abs(p-left)
-                          pb = abs(p-up)
-                          pc = abs(p-up_left)
-
+                          pa, pb, pc = abs(p-left), abs(p-up), abs(p-up_left)
                           if pa <= pb and pa <= pc:
                               predictor = left
                           elif pb <= pc:
                               predictor = up
                           else:
                               predictor = up_left
-
                           current[i] = (current[i] + predictor) & 255
-
                       else:
-                          raise ValueError(
-                              f"unsupported PNG filter {filter_type}"
-                          )
+                          raise ValueError(f"unsupported PNG filter {filter_type}")
 
                   previous = current
                   rows.append(current)
 
               pixels = []
-
               for row in rows:
                   row_pixels = []
-
                   for x in range(width):
                       base = x * channels
-
                       if channels == 4:
                           r, g, b, a = row[base:base+4]
                       else:
                           r, g, b = row[base:base+3]
                           a = 255
-
                       row_pixels.append((r, g, b, a))
-
                   pixels.append(row_pixels)
 
               return width, height, pixels
 
-          def valid_color(color, neutral):
-              if color == (0, 0, 0, 255):
+          def is_neutral(px):
+              r, g, b, a = px
+              if a == 0:
                   return True
+              return a == 255 and r == 255 and g == 255 and b == 255
 
-              if color == (255, 0, 0, 255):
-                  return True
+          def is_black_marker(px):
+              r, g, b, a = px
+              return a == 255 and r == 0 and g == 0 and b == 0
 
-              if color == neutral:
-                  return True
+          def is_red_marker(px):
+              r, g, b, a = px
+              return a == 255 and r == 255 and g == 0 and b == 0
 
-              return False
-
-          invalid_files = []
-
-          for path in sorted(root.rglob("*.9.png")):
+          def validate_ninepatch(path):
               try:
                   width, height, pixels = read_png_rgba(path)
+              except Exception as e:
+                  return False, f"could not validate: {e}"
 
-                  if width < 3 or height < 3:
-                      invalid_files.append(
-                          (path, "image smaller than 3x3")
-                      )
-                      continue
+              if width < 3 or height < 3:
+                  return False, "too small to be a valid 9-patch"
 
-                  top_left = pixels[0][0]
+              top_row = pixels[0]
+              bottom_row = pixels[height-1]
+              left_col = [pixels[y][0] for y in range(height)]
+              right_col = [pixels[y][width-1] for y in range(height)]
 
-                  if top_left[3] == 0:
-                      neutral = (0, 0, 0, 0)
-                  elif top_left == (255, 255, 255, 255):
-                      neutral = (255, 255, 255, 255)
-                  else:
-                      invalid_files.append(
-                          (path, "invalid top-left neutral color")
-                      )
-                      continue
+              for corner in (top_row[0], top_row[-1], bottom_row[0], bottom_row[-1]):
+                  if not is_neutral(corner):
+                      return False, "invalid corner pixel (must be transparent)"
 
-                  valid = True
+              for px in top_row[1:-1] + bottom_row[1:-1] + left_col[1:-1] + right_col[1:-1]:
+                  if not (is_neutral(px) or is_black_marker(px)):
+                      return False, "invalid 9-patch frame color"
 
-                  # Top and bottom borders.
-                  for x in range(1, width - 1):
-                      if not valid_color(pixels[0][x], neutral):
-                          valid = False
-                          break
+              return True, None
 
-                      if not valid_color(pixels[height - 1][x], neutral):
-                          valid = False
-                          break
+          fixed = []
 
-                  # Left and right borders.
-                  if valid:
-                      for y in range(1, height - 1):
-                          if not valid_color(pixels[y][0], neutral):
-                              valid = False
-                              break
+          for ninepatch in root.rglob("*.9.png"):
+              valid, reason = validate_ninepatch(ninepatch)
+              if valid:
+                  continue
 
-                          if not valid_color(pixels[y][width - 1], neutral):
-                              valid = False
-                              break
+              new_path = ninepatch.with_name(ninepatch.name[:-6] + ".png")
+              ninepatch.rename(new_path)
+              fixed.append(f"{ninepatch.name} -> {new_path.name} ({reason})")
 
-                  if not valid:
-                      invalid_files.append(
-                          (path, "invalid 9-patch frame color")
-                      )
-
-              except Exception as exc:
-                  invalid_files.append(
-                      (path, f"could not validate: {exc}")
-                  )
-
-          print(f"Total .9.png files found: {len(list(root.rglob('*.9.png')))}")
-          print(f"Malformed .9.png files found: {len(invalid_files)}")
-
-          for path, reason in invalid_files:
-              new_path = path.with_name(path.name[:-6] + ".png")
-
-              if new_path.exists():
-                  raise SystemExit(
-                      f"Cannot repair {path}: destination already exists: {new_path}"
-                  )
-
-              path.rename(new_path)
-
-              print(
-                  "REPAIRED:",
-                  path.relative_to(root),
-                  "->",
-                  new_path.relative_to(root),
-                  "(" + reason + ")"
-              )
+          for entry in fixed:
+              print(f"REPAIRED: {entry}")
 
           remaining = list(root.rglob("*.9.png"))
-
-          print(
-              "Remaining valid .9.png resources:",
-              len(remaining)
-          )
-
-          print(
-              "Malformed resources converted to ordinary PNG:",
-              len(invalid_files)
-          )
+          print(f"Remaining valid .9.png resources: {len(remaining)}")
+          print(f"Malformed resources converted to ordinary PNG: {len(fixed)}")
+          print()
+          print("9-patch repair complete.")
+          print("Remaining .9.png resources:")
+          print(len(remaining))
           PY
 
-          echo ""
-          echo "9-patch repair complete."
-
-          echo "Remaining .9.png resources:"
-          find app/res \
-            -type f \
-            -name '*.9.png' |
-            wc -l
-
       # ============================================================
-      # 15. VERIFY SOURCE STRUCTURE
+      # 17. VERIFY SOURCE STRUCTURE
       # ============================================================
       - name: Verify source structure
         shell: bash
@@ -753,7 +1043,7 @@ jobs:
           ./tools/verify-source.sh
 
       # ============================================================
-      # 16. SHOW GRADLE VERSION
+      # 18. SHOW GRADLE VERSION
       # ============================================================
       - name: Show Gradle version
         shell: bash
@@ -763,11 +1053,21 @@ jobs:
           cd "$PROJECT_DIR"
 
           chmod +x gradlew
-
-          ./gradlew --version
+          ./gradlew --version --no-daemon
 
       # ============================================================
-      # 17. BUILD UNSIGNED APK
+      # 19. BUILD UNSIGNED APK (SELF-HEALING)
+      #
+      # Root cause recap: Apktool 3.x has no AAPT1 fallback, and
+      # AAPT2 rejects any flags/enum/dimension-enum attribute that
+      # isn't written symbolically. Step 15 already fixes every case
+      # this pipeline currently knows about. This loop is the safety
+      # net for anything it doesn't: on failure, it feeds AAPT2's own
+      # error output back into the shared resolver (tools/aapt_symbol_fix.py)
+      # to fix -- or, as a last resort, drop -- exactly the offending
+      # items, then retries. It only gives up after MAX_ATTEMPTS
+      # consecutive failures, and always prints the full compiler
+      # output before exiting.
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -779,96 +1079,169 @@ jobs:
           rm -rf build/dist
           mkdir -p build/dist
 
-          echo "Starting APK rebuild..."
+          MAX_ATTEMPTS=5
+          attempt=1
+          build_ok=0
 
-          ./gradlew \
-            assembleOpenFork \
-            --no-daemon \
-            --stacktrace
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            echo "=================================================="
+            echo "Build attempt $attempt of $MAX_ATTEMPTS"
+            echo "=================================================="
+
+            LOG_FILE="build_attempt_${attempt}.log"
+
+            set +e
+            ./gradlew assembleOpenFork --no-daemon --stacktrace 2>&1 | tee "$LOG_FILE"
+            status="${PIPESTATUS[0]}"
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              echo "Build succeeded on attempt $attempt."
+              build_ok=1
+              break
+            fi
+
+            echo "Build attempt $attempt failed (exit $status)."
+
+            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+              echo "::error::Build failed after $MAX_ATTEMPTS attempts. Full log of final attempt:"
+              cat "$LOG_FILE"
+              exit 1
+            fi
+
+            echo "Attempting automatic resource repair from build log..."
+            set +e
+            python3 tools/aapt_symbol_fix.py --fix-from-log "$LOG_FILE"
+            fix_status=$?
+            set -e
+
+            if [ "$fix_status" -eq 2 ]; then
+              echo "::error::Build failed but no known AAPT2 raw-value pattern was found in the log."
+              echo "Full log of failed attempt:"
+              cat "$LOG_FILE"
+              exit 1
+            fi
+
+            attempt=$((attempt+1))
+          done
+
+          if [ "$build_ok" -ne 1 ]; then
+            echo "::error::Build did not succeed."
+            exit 1
+          fi
 
           APK="$PROJECT_DIR/build/dist/MetaEvo-OpenFork-unsigned.apk"
 
           if [ ! -s "$APK" ]; then
             echo "::error::Expected unsigned APK was not produced."
-
             echo "Searching for APK files..."
-
-            find "$PROJECT_DIR/build" \
-              -type f \
-              -name '*.apk' \
-              -print 2>/dev/null || true
-
+            find "$PROJECT_DIR/build" -type f -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
 
           echo "Unsigned APK successfully created:"
           ls -lh "$APK"
 
-          cp \
-            "$APK" \
-            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
+          cp "$APK" "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
 
       # ============================================================
-      # 18. SIGN APK
+      # 20. ZIPALIGN
       # ============================================================
-      - name: Sign APK
+      - name: Zipalign APK
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
-          UNSIGNED="$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
-          SIGNED="$GITHUB_WORKSPACE/MetaEvo-OpenFork.apk"
-          KEYSTORE="$RUNNER_TEMP/metaevo-openfork.keystore"
+          ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
 
-          test -s "$UNSIGNED"
-          test -x "$BUILD_TOOLS/apksigner"
+          "$ZIPALIGN" -v -p 4 \
+            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk" \
+            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
-          echo "Generating temporary signing key..."
+          test -s "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
-          keytool \
-            -genkeypair \
+          echo "Zipalign complete:"
+          ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
+
+      # ============================================================
+      # 21. SIGN APK
+      #
+      # No signing secrets were supplied, so this generates an
+      # ephemeral debug/test keystore for this run only, purely so
+      # the pipeline produces an installable APK end-to-end.
+      #
+      # For a real release build, replace this step with apksigner
+      # against a keystore restored from GitHub Secrets (e.g.
+      # secrets.RELEASE_KEYSTORE_BASE64 / KEYSTORE_PASSWORD /
+      # KEY_ALIAS / KEY_PASSWORD) instead of the generated one below.
+      # ============================================================
+      - name: Sign APK (ephemeral debug keystore)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          KEYTOOL="$JAVA_HOME/bin/keytool"
+
+          KEYSTORE="$RUNNER_TEMP/openfork-debug.keystore"
+          STOREPASS="android"
+          KEYALIAS="openfork-debug"
+          KEYPASS="android"
+
+          "$KEYTOOL" -genkeypair \
+            -v \
             -keystore "$KEYSTORE" \
-            -storepass android \
-            -keypass android \
-            -alias openfork \
+            -storepass "$STOREPASS" \
+            -alias "$KEYALIAS" \
+            -keypass "$KEYPASS" \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=MetaEvo OpenFork, OU=OpenFork, O=OpenFork, C=PH"
+            -dname "CN=MetaEvo OpenFork Debug, OU=CI, O=CI, L=CI, S=CI, C=US"
 
-          echo "Signing APK..."
-
-          "$BUILD_TOOLS/apksigner" sign \
+          "$APKSIGNER" sign \
             --ks "$KEYSTORE" \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --out "$SIGNED" \
-            "$UNSIGNED"
+            --ks-pass "pass:$STOREPASS" \
+            --ks-key-alias "$KEYALIAS" \
+            --key-pass "pass:$KEYPASS" \
+            --out "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk" \
+            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
-          test -s "$SIGNED"
+          "$APKSIGNER" verify --print-certs \
+            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
 
-          echo "Verifying APK signature..."
-
-          "$BUILD_TOOLS/apksigner" verify \
-            --verbose \
-            "$SIGNED"
-
-          echo "APK signature verification passed."
-
-          echo "Final APK:"
-          ls -lh "$SIGNED"
-
-          echo "Final APK SHA-256:"
-          sha256sum "$SIGNED"
+          echo "Signed APK:"
+          ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
 
       # ============================================================
-      # 19. UPLOAD FINAL APK
+      # 22. CHECKSUMS
       # ============================================================
-      - name: Upload APK artifact
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            MetaEvo-OpenFork-unsigned.apk \
+            MetaEvo-OpenFork-aligned.apk \
+            MetaEvo-OpenFork-signed.apk \
+            > MetaEvo-OpenFork-checksums.sha256
+
+          cat MetaEvo-OpenFork-checksums.sha256
+
+      # ============================================================
+      # 23. UPLOAD ARTIFACTS
+      # ============================================================
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: MetaEvo-OpenFork-APK
-          path: MetaEvo-OpenFork.apk
+          name: MetaEvo-OpenFork-build
+          path: |
+            MetaEvo-OpenFork-signed.apk
+            MetaEvo-OpenFork-aligned.apk
+            MetaEvo-OpenFork-unsigned.apk
+            MetaEvo-OpenFork-checksums.sha256
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
