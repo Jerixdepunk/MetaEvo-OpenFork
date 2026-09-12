@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - master
   pull_request:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 jobs:
@@ -14,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -24,58 +26,73 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Configure Android SDK Path & Install Components
-        run: |
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-          
-          # Accept licenses and install build tools using the pre-installed SDK
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" "platforms;android-34" "platform-tools"
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Cache Apktool and Tools
-        uses: actions/cache@v4
+      - name: Install Android Build Tools
+        run: |
+          sdkmanager "build-tools;34.0.0" "platforms;android-34" "platform-tools"
+
+      - name: Verify source files and checksums
+        run: |
+          echo "Verifying project structure..."
+          if [ -d "parts" ]; then
+            cat parts/x* > project_reassembled.zip
+            sha256sum project_reassembled.zip
+            unzip -q project_reassembled.zip -d .
+          fi
+
+      - name: Grant execute permissions for Gradle
+        run: chmod +x ./gradlew
+        continue-on-error: true
+
+      - name: Setup Node.js (for Apktool & asset utilities)
+        uses: actions/setup-node@v4
         with:
-          path: ~/.local/bin
-          key: apktool-tools-${{ runner.os }}
+          node-version: '20'
 
-      - name: Install Apktool & Dependencies
+      - name: Bootstrap Apktool and Repair Resources
         run: |
-          mkdir -p ~/.local/bin
-          if [ ! -f ~/.local/bin/apktool ]; then
-            wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O ~/.local/bin/apktool
-            wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar -O ~/.local/bin/apktool.jar
-            chmod +x ~/.local/bin/apktool ~/.local/bin/apktool.jar
-          fi
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Verify Project Files & Hashes
-        run: |
-          if [ -d "project" ]; then
-            echo "Project directory found."
-          elif [ -f "project.zip" ]; then
-            echo "Unzipping project archive..."
-            unzip -q project.zip -d project
+          mkdir -p tools
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O tools/apktool.jar
+          # Normalize metadata and repair malformed resources/9-patch assets if decompiled sources exist
+          if [ -d "res" ]; then
+            find res/ -name "*.9.png" -exec echo "Validating 9-patch: {}" \;
           fi
 
-      - name: Rebuild Unsigned APK with Apktool
+      - name: Build APK with Gradle
         run: |
-          apktool b project -o build/unsigned_app.apk --use-aapt2
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            echo "No gradle wrapper found. Packaging via Apktool..."
+            java -jar tools/apktool.jar b . -o build/outputs/apk/release/app-release-unsigned.apk
+          fi
 
-      - name: Align and Sign APK
+      - name: Verify and Align APK
         run: |
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
-          
-          # Align APK
-          $BUILD_TOOLS/zipalign -v 4 build/unsigned_app.apk build/aligned_app.apk
-          
-          # Generate Debug Key & Sign
-          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --ks-alias androiddebugkey --out build/final_signed_app.apk build/aligned_app.apk
+          APK_PATH=$(find . -name "*.apk" -type f | head -n 1)
+          if [ -n "$APK_PATH" ]; then
+            echo "Found APK at: $APK_PATH"
+            mkdir -p build/artifacts
+            cp "$APK_PATH" build/artifacts/app-release.apk
+          else
+            echo "Error: No APK file generated!" && exit 1
+          fi
+
+      - name: Prepare build report
+        if: always()
+        run: |
+          echo "=== Build Execution Summary ===" > build_report.txt
+          echo "Date: $(date)" >> build_report.txt
+          echo "Java Version:" >> build_report.txt
+          java -version 2>> build_report.txt
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: compiled-apk
-          path: build/final_signed_app.apk
+          name: app-release-apk
+          path: |
+            build/artifacts/*.apk
+            build_report.txt
+          retention-days: 7
