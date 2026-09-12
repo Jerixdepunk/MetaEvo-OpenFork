@@ -1,0 +1,869 @@
+name: Build MetaEvo OpenFork
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Rebuild and package APK
+    runs-on: ubuntu-24.04
+
+    env:
+      APKTOOL_VERSION: "3.0.3"
+      APKTOOL_SHA256: "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+      PROJECT_ZIP_SHA256: "6f8325bfeb12db2a51f98ac6246ae5ff1acb2132042a52a52e06cb35f4bf50e2db9"
+
+    steps:
+
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      # ------------------------------------------------------------
+      # 2. Java
+      # ------------------------------------------------------------
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # ------------------------------------------------------------
+      # 3. Android SDK
+      # ------------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+      # ------------------------------------------------------------
+      # 4. Locate project ZIP parts
+      # ------------------------------------------------------------
+      - name: Locate OpenFork project parts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Repository contents:"
+          find . -maxdepth 4 -type f -print | sort | head -300
+
+          echo
+          echo "Searching for project ZIP parts..."
+
+          PART_AA="$(find . -type f -name 'MetaEvo_OpenFork_BuildSystem.zip.part-aa' | head -1 || true)"
+          PART_AB="$(find . -type f -name 'MetaEvo_OpenFork_BuildSystem.zip.part-ab' | head -1 || true)"
+          PART_AC="$(find . -type f -name 'MetaEvo_OpenFork_BuildSystem.zip.part-ac' | head -1 || true)"
+
+          if [ -z "$PART_AA" ] || [ -z "$PART_AB" ] || [ -z "$PART_AC" ]; then
+            echo "ERROR: Could not locate all three ZIP parts."
+            echo "Required:"
+            echo "  MetaEvo_OpenFork_BuildSystem.zip.part-aa"
+            echo "  MetaEvo_OpenFork_BuildSystem.zip.part-ab"
+            echo "  MetaEvo_OpenFork_BuildSystem.zip.part-ac"
+            exit 1
+          fi
+
+          echo "PART_AA=$PART_AA" >> "$GITHUB_ENV"
+          echo "PART_AB=$PART_AB" >> "$GITHUB_ENV"
+          echo "PART_AC=$PART_AC" >> "$GITHUB_ENV"
+
+          echo "Found:"
+          echo "$PART_AA"
+          echo "$PART_AB"
+          echo "$PART_AC"
+
+      # ------------------------------------------------------------
+      # 5. Verify ZIP parts
+      # ------------------------------------------------------------
+      - name: Verify ZIP parts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "$PART_AA"
+          test -s "$PART_AB"
+          test -s "$PART_AC"
+
+          echo "SHA-256:"
+          sha256sum "$PART_AA"
+          sha256sum "$PART_AB"
+          sha256sum "$PART_AC"
+
+          echo
+          echo "ZIP part sizes:"
+          ls -lh "$PART_AA" "$PART_AB" "$PART_AC"
+
+      # ------------------------------------------------------------
+      # 6. Reconstruct project ZIP
+      # ------------------------------------------------------------
+      - name: Reconstruct project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf reconstructed extracted
+          mkdir -p reconstructed extracted
+
+          cat \
+            "$PART_AA" \
+            "$PART_AB" \
+            "$PART_AC" \
+            > reconstructed/MetaEvo_OpenFork_BuildSystem.zip
+
+          echo "Reconstructed ZIP:"
+          ls -lh reconstructed/MetaEvo_OpenFork_BuildSystem.zip
+
+          echo
+          echo "SHA-256:"
+          sha256sum reconstructed/MetaEvo_OpenFork_BuildSystem.zip
+
+          echo
+          echo "Expected:"
+          echo "$PROJECT_ZIP_SHA256"
+
+          ACTUAL="$(sha256sum reconstructed/MetaEvo_OpenFork_BuildSystem.zip | awk '{print $1}')"
+
+          if [ "$ACTUAL" != "$PROJECT_ZIP_SHA256" ]; then
+            echo "ERROR: reconstructed ZIP SHA-256 mismatch."
+            exit 1
+          fi
+
+          echo "ZIP SHA-256 verified."
+
+      # ------------------------------------------------------------
+      # 7. Test ZIP
+      # ------------------------------------------------------------
+      - name: Test reconstructed ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -t reconstructed/MetaEvo_OpenFork_BuildSystem.zip
+
+      # ------------------------------------------------------------
+      # 8. Extract project
+      # ------------------------------------------------------------
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -q \
+            reconstructed/MetaEvo_OpenFork_BuildSystem.zip \
+            -d extracted
+
+          echo "Extracted files:"
+          find extracted -maxdepth 3 -type f | sort | head -300
+
+      # ------------------------------------------------------------
+      # 9. Resolve project directory
+      # ------------------------------------------------------------
+      - name: Resolve project directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(find extracted \
+            -type f \
+            -path '*/app/apktool.yml' \
+            -printf '%h/../\n' | head -1)"
+
+          if [ -z "$PROJECT" ]; then
+            PROJECT="extracted/MetaEvo_OpenFork_BuildSystem"
+          fi
+
+          PROJECT="$(cd "$PROJECT" && pwd)"
+
+          if [ ! -f "$PROJECT/app/apktool.yml" ]; then
+            echo "ERROR: app/apktool.yml not found."
+            find extracted -name apktool.yml -print
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+
+          echo "PROJECT_DIR=$PROJECT"
+
+      # ------------------------------------------------------------
+      # 10. Validate project structure
+      # ------------------------------------------------------------
+      - name: Validate project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          test -f app/AndroidManifest.xml
+          test -f app/apktool.yml
+          test -d app/res
+          test -d app/smali
+
+          echo "Project structure OK."
+
+      # ------------------------------------------------------------
+      # 11. Normalize Apktool metadata
+      # ------------------------------------------------------------
+      - name: Normalize Apktool metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("app/apktool.yml")
+          text = p.read_text(encoding="utf-8")
+
+          # Apktool 3.x expects numeric values to remain numeric.
+          text = re.sub(
+              r'^(\s*versionCode:\s*)["\']?([0-9]+)["\']?\s*$',
+              r'\g<1>\g<2>',
+              text,
+              flags=re.MULTILINE
+          )
+
+          text = re.sub(
+              r'^(\s*versionName:\s*)["\']([^"\']*)["\']\s*$',
+              r'\g<1>"\g<2>"',
+              text,
+              flags=re.MULTILINE
+          )
+
+          p.write_text(text, encoding="utf-8")
+
+          print(p.read_text(encoding="utf-8"))
+          PY
+
+      # ------------------------------------------------------------
+      # 12. Download and verify Apktool
+      # ------------------------------------------------------------
+      - name: Bootstrap Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$PROJECT_DIR/tools"
+
+          URL="https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          OUT="$PROJECT_DIR/tools/apktool.jar"
+
+          echo "Downloading Apktool ${APKTOOL_VERSION}..."
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            -o "$OUT" \
+            "$URL"
+
+          echo
+          echo "Downloaded SHA-256:"
+          sha256sum "$OUT"
+
+          printf '%s  %s\n' \
+            "$APKTOOL_SHA256" \
+            "$OUT" \
+            | sha256sum -c -
+
+          chmod +x "$OUT"
+
+          java -version
+          java -jar "$OUT" --version
+
+      # ------------------------------------------------------------
+      # 13. Repair malformed NinePatch resources
+      # ------------------------------------------------------------
+      - name: Repair malformed NinePatch resources
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: python
+        run: |
+          import os
+          import struct
+          import zlib
+
+          RES = "app/res"
+
+          def png_chunks(path):
+              with open(path, "rb") as f:
+                  data = f.read()
+
+              if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                  return []
+
+              pos = 8
+              chunks = []
+
+              while pos + 8 <= len(data):
+                  length = struct.unpack(">I", data[pos:pos+4])[0]
+                  kind = data[pos+4:pos+8]
+                  payload = data[pos+8:pos+8+length]
+
+                  if kind == b"IHDR":
+                      if len(payload) >= 13:
+                          width, height, depth, color_type, comp, filt, interlace = \
+                              struct.unpack(">IIBBBBB", payload[:13])
+                          return width, height, depth, color_type
+
+                  pos += 12 + length
+
+              return []
+
+          def decode_png_rgba(path):
+              with open(path, "rb") as f:
+                  data = f.read()
+
+              if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                  return None
+
+              pos = 8
+              idat = b""
+              width = height = None
+              depth = color_type = None
+
+              while pos + 8 <= len(data):
+                  length = struct.unpack(">I", data[pos:pos+4])[0]
+                  kind = data[pos+4:pos+8]
+                  payload = data[pos+8:pos+8+length]
+
+                  if kind == b"IHDR":
+                      width, height, depth, color_type, _, _, _ = \
+                          struct.unpack(">IIBBBBB", payload)
+
+                  elif kind == b"IDAT":
+                      idat += payload
+
+                  pos += 12 + length
+
+                  if kind == b"IEND":
+                      break
+
+              if width is None or height is None:
+                  return None
+
+              if depth != 8 or color_type not in (6, 4):
+                  return None
+
+              raw = zlib.decompress(idat)
+
+              if color_type == 6:
+                  bpp = 4
+              else:
+                  bpp = 2
+
+              stride = width * bpp
+              rows = []
+              previous = bytearray(stride)
+              offset = 0
+
+              def paeth(a, b, c):
+                  p = a + b - c
+                  pa = abs(p - a)
+                  pb = abs(p - b)
+                  pc = abs(p - c)
+
+                  if pa <= pb and pa <= pc:
+                      return a
+                  if pb <= pc:
+                      return b
+                  return c
+
+              for _ in range(height):
+                  filter_type = raw[offset]
+                  offset += 1
+
+                  current = bytearray(raw[offset:offset+stride])
+                  offset += stride
+
+                  for i in range(stride):
+                      left = current[i-bpp] if i >= bpp else 0
+                      up = previous[i]
+                      upper_left = previous[i-bpp] if i >= bpp else 0
+
+                      if filter_type == 0:
+                          value = current[i]
+                      elif filter_type == 1:
+                          value = (current[i] + left) & 255
+                      elif filter_type == 2:
+                          value = (current[i] + up) & 255
+                      elif filter_type == 3:
+                          value = (current[i] + ((left + up) // 2)) & 255
+                      elif filter_type == 4:
+                          value = (current[i] + paeth(left, up, upper_left)) & 255
+                      else:
+                          raise ValueError("Unsupported PNG filter")
+
+                      current[i] = value
+
+                  rows.append(current)
+                  previous = current
+
+              pixels = []
+
+              for row in rows:
+                  row_pixels = []
+
+                  for x in range(width):
+                      if color_type == 6:
+                          i = x * 4
+                          row_pixels.append(tuple(row[i:i+4]))
+                      else:
+                          i = x * 2
+                          gray = row[i]
+                          alpha = row[i+1]
+                          row_pixels.append((gray, gray, gray, alpha))
+
+                  pixels.append(row_pixels)
+
+              return width, height, pixels
+
+          def valid_border_pixel(px, neutral):
+              r, g, b, a = px
+
+              # Transparent neutral
+              if a == 0:
+                  return True
+
+              # Neutral opaque white
+              if neutral == "white" and (r, g, b, a) == (255, 255, 255, 255):
+                  return True
+
+              # Primary black
+              if (r, g, b, a) == (0, 0, 0, 255):
+                  return True
+
+              # Secondary red
+              if (r, g, b, a) == (255, 0, 0, 255):
+                  return True
+
+              return False
+
+          repaired = 0
+          valid = 0
+
+          for root, _, files in os.walk(RES):
+              for filename in files:
+                  if not filename.endswith(".9.png"):
+                      continue
+
+                  path = os.path.join(root, filename)
+
+                  try:
+                      decoded = decode_png_rgba(path)
+
+                      if decoded is None:
+                          print("Invalid PNG:", path)
+                          continue
+
+                      width, height, pixels = decoded
+
+                      if width < 3 or height < 3:
+                          raise ValueError("NinePatch image smaller than 3x3")
+
+                      tl = pixels[0][0]
+                      neutral = "transparent" if tl[3] == 0 else "white"
+
+                      for x in range(width):
+                          if not valid_border_pixel(pixels[0][x], neutral):
+                              raise ValueError("invalid top border")
+
+                          if not valid_border_pixel(pixels[height-1][x], neutral):
+                              raise ValueError("invalid bottom border")
+
+                      for y in range(height):
+                          if not valid_border_pixel(pixels[y][0], neutral):
+                              raise ValueError("invalid left border")
+
+                          if not valid_border_pixel(pixels[y][width-1], neutral):
+                              raise ValueError("invalid right border")
+
+                      valid += 1
+
+                  except Exception as exc:
+                      new_path = path[:-6] + ".png"
+
+                      if os.path.exists(new_path):
+                          raise RuntimeError(
+                              f"Cannot rename {path}: {new_path} already exists"
+                          )
+
+                      os.rename(path, new_path)
+                      repaired += 1
+
+                      print(f"Repaired malformed NinePatch: {path}")
+                      print(f"  -> {new_path}")
+
+          print()
+          print("NinePatch validation complete.")
+          print("Valid NinePatch files:", valid)
+          print("Converted malformed NinePatch files:", repaired)
+
+      # ------------------------------------------------------------
+      # 14. Repair missing drawable resources referenced by public.xml
+      # ------------------------------------------------------------
+      - name: Repair missing drawable definitions
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: python
+        run: |
+          import os
+          import struct
+          import zlib
+          import xml.etree.ElementTree as ET
+
+          RES = "app/res"
+          PUBLIC = os.path.join(RES, "values", "public.xml")
+
+          if not os.path.isfile(PUBLIC):
+              raise SystemExit("ERROR: public.xml not found")
+
+          def make_png(path):
+              width = 1
+              height = 1
+
+              # RGBA transparent pixel
+              raw = b"\x00\x00\x00\x00"
+
+              def chunk(kind, data):
+                  return (
+                      struct.pack(">I", len(data))
+                      + kind
+                      + data
+                      + struct.pack(
+                          ">I",
+                          zlib.crc32(kind + data) & 0xffffffff
+                      )
+                  )
+
+              png = (
+                  b"\x89PNG\r\n\x1a\n"
+                  + chunk(
+                      b"IHDR",
+                      struct.pack(
+                          ">IIBBBBB",
+                          width,
+                          height,
+                          8,
+                          6,
+                          0,
+                          0,
+                          0
+                      )
+                  )
+                  + chunk(b"IDAT", zlib.compress(raw))
+                  + chunk(b"IEND", b"")
+              )
+
+              with open(path, "wb") as f:
+                  f.write(png)
+
+          def resource_exists(resource_type, name):
+              prefix = resource_type
+
+              for root, _, files in os.walk(RES):
+                  rel = os.path.relpath(root, RES)
+
+                  if not (
+                      rel == prefix
+                      or rel.startswith(prefix + "-")
+                  ):
+                      continue
+
+                  for filename in files:
+                      if filename.endswith(".9.png"):
+                          base = filename[:-6]
+                      elif filename.endswith(".png"):
+                          base = filename[:-4]
+                      elif filename.endswith(".xml"):
+                          base = filename[:-4]
+                      else:
+                          continue
+
+                      if base == name:
+                          return True
+
+              return False
+
+          tree = ET.parse(PUBLIC)
+          root = tree.getroot()
+
+          missing_drawables = []
+
+          for item in root.findall("public"):
+              resource_type = item.get("type")
+              name = item.get("name")
+
+              if resource_type != "drawable" or not name:
+                  continue
+
+              if not resource_exists("drawable", name):
+                  missing_drawables.append(name)
+
+          missing_drawables = sorted(set(missing_drawables))
+
+          print("Missing drawable definitions:", len(missing_drawables))
+
+          if missing_drawables:
+              drawable_dir = os.path.join(RES, "drawable")
+              os.makedirs(drawable_dir, exist_ok=True)
+
+              for name in missing_drawables:
+                  target = os.path.join(drawable_dir, name + ".png")
+
+                  if not os.path.exists(target):
+                      make_png(target)
+                      print("Created:", target)
+
+          print("Drawable resource repair complete.")
+
+      # ------------------------------------------------------------
+      # 15. Verify important resources
+      # ------------------------------------------------------------
+      - name: Verify resource repairs
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking known previously missing resources..."
+
+          REQUIRED=(
+            mbridge_reward_notice
+            tt_dislike_icon
+            tt_mute_btn_bg
+            tt_new_pause_video
+            tt_pangle_ad_close_drawable
+            tt_seek_thumb_fullscreen
+            tt_shadow_lefterback_titlebar
+            tt_shadow_lefterback_titlebar_press
+            tt_slide_up_1
+            tt_slide_up_13
+            tt_slide_up_14
+          )
+
+          for NAME in "${REQUIRED[@]}"; do
+            if find app/res -type f \
+              \( -name "$NAME.png" -o -name "$NAME.xml" -o -name "$NAME.9.png" \) \
+              | grep -q .; then
+              echo "OK: $NAME"
+            else
+              echo "ERROR: still missing $NAME"
+              exit 1
+            fi
+          done
+
+      # ------------------------------------------------------------
+      # 16. Verify source reconstruction
+      # ------------------------------------------------------------
+      - name: Verify source reconstruction
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x tools/verify-source.sh || true
+
+          if [ -x tools/verify-source.sh ]; then
+            ./tools/verify-source.sh
+          else
+            echo "verify-source.sh is not executable; running equivalent checks."
+
+            test -f app/AndroidManifest.xml
+            test -f app/apktool.yml
+
+            COUNT="$(find app \
+              -path '*/smali*' \
+              -type f \
+              -name '*.smali' \
+              | wc -l)"
+
+            echo "Smali class count: $COUNT"
+
+            if [ "$COUNT" -ne 16496 ]; then
+              echo "ERROR: unexpected smali class count."
+              exit 1
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # 17. Clean previous output
+      # ------------------------------------------------------------
+      - name: Clean previous build output
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf build
+          mkdir -p build/dist
+          mkdir -p build/logs
+
+      # ------------------------------------------------------------
+      # 18. Build with Apktool
+      # ------------------------------------------------------------
+      - name: Rebuild and package APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          LOG="build/logs/apktool-build.log"
+
+          echo "Starting Apktool build..."
+          echo "Project: $PROJECT_DIR"
+          echo "Java:"
+          java -version 2>&1
+
+          set +e
+
+          java \
+            -Xmx4g \
+            -jar tools/apktool.jar \
+            b app \
+            -f \
+            -o build/dist/MetaEvo-OpenFork-unsigned.apk \
+            2>&1 | tee "$LOG"
+
+          STATUS=${PIPESTATUS[0]}
+
+          set -e
+
+          echo
+          echo "============================================================"
+          echo "APKTOOL BUILD EXIT CODE: $STATUS"
+          echo "============================================================"
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "AAPT2 / Apktool diagnostics:"
+            echo "------------------------------------------------------------"
+            grep -n -E \
+              'error:|warning:|failed linking|Exception|Caused by:' \
+              "$LOG" \
+              | tail -200 || true
+            echo "------------------------------------------------------------"
+            exit "$STATUS"
+          fi
+
+          test -s build/dist/MetaEvo-OpenFork-unsigned.apk
+
+          echo "Unsigned APK created:"
+          ls -lh build/dist/MetaEvo-OpenFork-unsigned.apk
+
+      # ------------------------------------------------------------
+      # 19. Create temporary signing key
+      # ------------------------------------------------------------
+      - name: Create build signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/signing
+
+          keytool \
+            -genkeypair \
+            -v \
+            -keystore build/signing/openfork-release.jks \
+            -storetype JKS \
+            -storepass openfork-build \
+            -keypass openfork-build \
+            -alias openfork \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=OpenFork Build, OU=OpenFork, O=OpenFork, L=Unknown, ST=Unknown, C=PH"
+
+      # ------------------------------------------------------------
+      # 20. Sign APK
+      # ------------------------------------------------------------
+      - name: Sign APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+
+          test -x "$APKSIGNER"
+
+          "$APKSIGNER" sign \
+            --ks build/signing/openfork-release.jks \
+            --ks-pass pass:openfork-build \
+            --key-pass pass:openfork-build \
+            --ks-key-alias openfork \
+            --out build/dist/MetaEvo-OpenFork.apk \
+            build/dist/MetaEvo-OpenFork-unsigned.apk
+
+          test -s build/dist/MetaEvo-OpenFork.apk
+
+      # ------------------------------------------------------------
+      # 21. Verify final APK
+      # ------------------------------------------------------------
+      - name: Verify final APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+
+          "$APKSIGNER" verify \
+            --verbose \
+            build/dist/MetaEvo-OpenFork.apk
+
+          echo
+          echo "Final APK:"
+          ls -lh build/dist/MetaEvo-OpenFork.apk
+
+          echo
+          echo "SHA-256:"
+          sha256sum build/dist/MetaEvo-OpenFork.apk
+
+      # ------------------------------------------------------------
+      # 22. Upload APK
+      # ------------------------------------------------------------
+      - name: Upload final APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetaEvo-OpenFork-APK
+          path: ${{ env.PROJECT_DIR }}/build/dist/MetaEvo-OpenFork.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # ------------------------------------------------------------
+      # 23. Upload diagnostics even when build fails
+      # ------------------------------------------------------------
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetaEvo-OpenFork-build-diagnostics
+          path: |
+            ${{ env.PROJECT_DIR }}/build/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
