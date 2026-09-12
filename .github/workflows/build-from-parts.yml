@@ -279,7 +279,69 @@ jobs:
           java -jar tools/apktool.jar --version
 
       # ============================================================
-      # 12. REPAIR MALFORMED 9-PATCH RESOURCES
+      # 12. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
+      #
+      # public.xml can declare fixed IDs for resources whose backing
+      # files are missing (e.g. lost before packaging). AAPT2 fails
+      # to link if a declared symbol has no definition. This removes
+      # only the specific <public> entries that have no matching
+      # file resource, leaving everything else untouched.
+      # ============================================================
+      - name: Prune orphaned public.xml declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          res = Path("app/res")
+          public_xml_path = res / "values" / "public.xml"
+          text = public_xml_path.read_text(encoding="utf-8")
+
+          FILE_BASED_TYPES = {
+              "drawable", "mipmap", "layout", "menu", "anim",
+              "animator", "color", "xml", "raw", "font", "transition"
+          }
+
+          def file_resource_exists(res_type, name):
+              for d in res.glob(f"{res_type}*"):
+                  if d.is_dir():
+                      for f in d.iterdir():
+                          if f.is_file() and f.stem == name:
+                              return True
+              return False
+
+          pattern = re.compile(
+              r'^[ \t]*<public type="([^"]+)" name="([^"]+)" id="[^"]+"\s*/>\s*\n?',
+              re.MULTILINE
+          )
+
+          removed = []
+
+          def repl(m):
+              rtype, name = m.group(1), m.group(2)
+              if rtype in FILE_BASED_TYPES and not file_resource_exists(rtype, name):
+                  removed.append(f"{rtype}/{name}")
+                  return ""
+              return m.group(0)
+
+          new_text = pattern.sub(repl, text)
+
+          if removed:
+              public_xml_path.write_text(new_text, encoding="utf-8")
+              print(f"Removed {len(removed)} orphaned public.xml declarations:")
+              for r in removed:
+                  print(" -", r)
+          else:
+              print("No orphaned declarations found.")
+          PY
+
+      # ============================================================
+      # 13. REPAIR MALFORMED 9-PATCH RESOURCES
       #
       # AAPT2 rejects malformed .9.png frame pixels.
       #
@@ -538,7 +600,7 @@ jobs:
             wc -l
 
       # ============================================================
-      # 13. VERIFY SOURCE STRUCTURE
+      # 14. VERIFY SOURCE STRUCTURE
       # ============================================================
       - name: Verify source structure
         shell: bash
@@ -550,7 +612,7 @@ jobs:
           ./tools/verify-source.sh
 
       # ============================================================
-      # 14. SHOW GRADLE VERSION
+      # 15. SHOW GRADLE VERSION
       # ============================================================
       - name: Show Gradle version
         shell: bash
@@ -564,7 +626,7 @@ jobs:
           ./gradlew --version
 
       # ============================================================
-      # 15. BUILD UNSIGNED APK
+      # 16. BUILD UNSIGNED APK
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -606,7 +668,7 @@ jobs:
             "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
 
       # ============================================================
-      # 16. SIGN APK
+      # 17. SIGN APK
       # ============================================================
       - name: Sign APK
         shell: bash
@@ -660,7 +722,7 @@ jobs:
           sha256sum "$SIGNED"
 
       # ============================================================
-      # 17. UPLOAD FINAL APK
+      # 18. UPLOAD FINAL APK
       # ============================================================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
