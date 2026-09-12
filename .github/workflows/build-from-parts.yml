@@ -281,11 +281,17 @@ jobs:
       # ============================================================
       # 12. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
       #
-      # public.xml can declare fixed IDs for resources whose backing
-      # files are missing (e.g. lost before packaging). AAPT2 fails
-      # to link if a declared symbol has no definition. This removes
-      # only the specific <public> entries that have no matching
-      # file resource, leaving everything else untouched.
+      # public.xml can declare fixed IDs for resources that no longer
+      # exist anywhere in the source tree (lost before packaging).
+      # AAPT2 fails to link if a declared symbol has no definition.
+      #
+      # This build's own resource tree (every file under non-values
+      # res/ directories, plus every named tag/item declared inside
+      # any values/*.xml file) is used as the source of truth for
+      # "does this resource actually exist?" -- covering ALL resource
+      # types generically (drawable, mipmap, layout, interpolator,
+      # anim, color, string, style, attr, id, etc.), not a fixed list.
+      # Only <public> entries with no matching definition are removed.
       # ============================================================
       - name: Prune orphaned public.xml declarations
         shell: bash
@@ -302,29 +308,57 @@ jobs:
           public_xml_path = res / "values" / "public.xml"
           text = public_xml_path.read_text(encoding="utf-8")
 
-          FILE_BASED_TYPES = {
-              "drawable", "mipmap", "layout", "menu", "anim",
-              "animator", "color", "xml", "raw", "font", "transition"
-          }
+          declared = set()
 
-          def file_resource_exists(res_type, name):
-              for d in res.glob(f"{res_type}*"):
-                  if d.is_dir():
-                      for f in d.iterdir():
-                          if f.is_file() and f.stem == name:
-                              return True
-              return False
+          name_tag_re = re.compile(r'<([\w.-]+)\b([^>]*)/?>')
+          attr_pair_re = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
 
-          pattern = re.compile(
-              r'^[ \t]*<public type="([^"]+)" name="([^"]+)" id="[^"]+"\s*/>\s*\n?',
-              re.MULTILINE
-          )
+          # 1. Every name= declared anywhere inside any values/*.xml file
+          #    (colors, strings, styles, attrs, ids, styleables, etc.)
+          for xml_file in res.rglob("*.xml"):
+              if xml_file == public_xml_path:
+                  continue
+              try:
+                  content = xml_file.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              for m in name_tag_re.finditer(content):
+                  tag = m.group(1)
+                  attrs = dict(attr_pair_re.findall(m.group(2)))
+                  name = attrs.get("name")
+                  if not name:
+                      continue
+                  if tag == "item":
+                      rtype = attrs.get("type")
+                      if rtype:
+                          declared.add((rtype, name))
+                  else:
+                      declared.add((tag, name))
+
+          # 2. Every file inside a non-values resource directory
+          #    (drawable*, mipmap*, layout*, interpolator*, anim*, ...)
+          for entry in res.iterdir():
+              if not entry.is_dir():
+                  continue
+              if entry.name == "values" or entry.name.startswith("values-"):
+                  continue
+              rtype = entry.name.split("-")[0]
+              for f in entry.iterdir():
+                  if f.is_file():
+                      declared.add((rtype, f.stem))
+
+          def resource_exists(rtype, name):
+              return (rtype, name) in declared
+
+          pattern = re.compile(r'<public\s+([^>]*?)/>', re.DOTALL)
 
           removed = []
 
           def repl(m):
-              rtype, name = m.group(1), m.group(2)
-              if rtype in FILE_BASED_TYPES and not file_resource_exists(rtype, name):
+              attrs = dict(attr_pair_re.findall(m.group(1)))
+              rtype = attrs.get("type")
+              name = attrs.get("name")
+              if rtype and name and not resource_exists(rtype, name):
                   removed.append(f"{rtype}/{name}")
                   return ""
               return m.group(0)
@@ -341,7 +375,114 @@ jobs:
           PY
 
       # ============================================================
-      # 13. REPAIR MALFORMED 9-PATCH RESOURCES
+      # 13. REPAIR RAW GRAVITY FLAG VALUES IN STYLES
+      #
+      # AAPT2 requires flags-typed attributes (like android:gravity)
+      # to use symbolic flag names ("center", "bottom|center_horizontal")
+      # rather than raw integers. Apktool sometimes decompiles these
+      # back as bare hex/decimal values, which AAPT2 then rejects with
+      # "expected flags but got (raw string) 0x..". This decodes any
+      # such raw gravity values into their symbolic equivalent using
+      # the same bitmasks Android's framework defines for gravity.
+      # ============================================================
+      - name: Repair raw gravity flag values in styles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          res = Path("app/res")
+
+          GRAVITY_VERTICAL = {
+              0x70: "fill_vertical",
+              0x50: "bottom",
+              0x30: "top",
+              0x10: "center_vertical",
+          }
+          GRAVITY_HORIZONTAL = {
+              0x07: "fill_horizontal",
+              0x05: "right",
+              0x03: "left",
+              0x01: "center_horizontal",
+          }
+          GRAVITY_EXACT = {
+              0x11: "center",
+              0x77: "fill",
+          }
+
+          def decode_gravity(value):
+              if value in GRAVITY_EXACT:
+                  return GRAVITY_EXACT[value]
+
+              parts = []
+              remaining = value
+
+              vmask = value & 0x70
+              if vmask in GRAVITY_VERTICAL:
+                  parts.append(GRAVITY_VERTICAL[vmask])
+                  remaining &= ~0x70
+
+              hmask = value & 0x07
+              if hmask in GRAVITY_HORIZONTAL:
+                  parts.append(GRAVITY_HORIZONTAL[hmask])
+                  remaining &= ~0x07
+
+              if value & 0x80:
+                  parts.append("clip_vertical")
+                  remaining &= ~0x80
+
+              if value & 0x08:
+                  parts.append("clip_horizontal")
+                  remaining &= ~0x08
+
+              if remaining != 0 or not parts:
+                  return None
+
+              return "|".join(parts)
+
+          item_pattern = re.compile(
+              r'(<item\s+name="[^"]*[Gg]ravity"[^>]*>)\s*'
+              r'(0[xX][0-9a-fA-F]+|-?[0-9]+)\s*(</item>)'
+          )
+
+          total_fixed = 0
+
+          for xml_file in res.rglob("*.xml"):
+              text = xml_file.read_text(encoding="utf-8")
+              fixed = []
+
+              def repl(m, fixed=fixed):
+                  open_tag, raw_value, close_tag = m.group(1), m.group(2), m.group(3)
+                  value = (
+                      int(raw_value, 16)
+                      if raw_value.lower().startswith("0x")
+                      else int(raw_value)
+                  )
+                  symbolic = decode_gravity(value)
+                  if symbolic is None:
+                      return m.group(0)
+                  fixed.append(f"{raw_value} -> {symbolic}")
+                  return f"{open_tag}{symbolic}{close_tag}"
+
+              new_text = item_pattern.sub(repl, text)
+
+              if fixed:
+                  xml_file.write_text(new_text, encoding="utf-8")
+                  total_fixed += len(fixed)
+                  print(f"{xml_file.relative_to(res)}:")
+                  for f in fixed:
+                      print("  -", f)
+
+          print(f"Total gravity values converted: {total_fixed}")
+          PY
+
+      # ============================================================
+      # 14. REPAIR MALFORMED 9-PATCH RESOURCES
       #
       # AAPT2 rejects malformed .9.png frame pixels.
       #
@@ -600,7 +741,7 @@ jobs:
             wc -l
 
       # ============================================================
-      # 14. VERIFY SOURCE STRUCTURE
+      # 15. VERIFY SOURCE STRUCTURE
       # ============================================================
       - name: Verify source structure
         shell: bash
@@ -612,7 +753,7 @@ jobs:
           ./tools/verify-source.sh
 
       # ============================================================
-      # 15. SHOW GRADLE VERSION
+      # 16. SHOW GRADLE VERSION
       # ============================================================
       - name: Show Gradle version
         shell: bash
@@ -626,7 +767,7 @@ jobs:
           ./gradlew --version
 
       # ============================================================
-      # 16. BUILD UNSIGNED APK
+      # 17. BUILD UNSIGNED APK
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -668,7 +809,7 @@ jobs:
             "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
 
       # ============================================================
-      # 17. SIGN APK
+      # 18. SIGN APK
       # ============================================================
       - name: Sign APK
         shell: bash
@@ -722,7 +863,7 @@ jobs:
           sha256sum "$SIGNED"
 
       # ============================================================
-      # 18. UPLOAD FINAL APK
+      # 19. UPLOAD FINAL APK
       # ============================================================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
