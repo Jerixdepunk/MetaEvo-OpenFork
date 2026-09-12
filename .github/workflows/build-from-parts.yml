@@ -373,6 +373,21 @@ jobs:
           name_tag_re = re.compile(r'<([\w.-]+)\b([^>]*)/?>')
           attr_pair_re = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
 
+          # AAPT2's actual *resource type* often differs from the XML tag
+          # name used to declare it (e.g. <string-array> declares an
+          # "array" resource, not a "string-array" resource; a
+          # <declare-styleable> declares a "styleable" resource). Without
+          # this mapping, entries declared via these tags would be
+          # bucketed under the wrong type and later look "orphaned" even
+          # though they are legitimately defined -- a latent bug that
+          # risks over-pruning valid resources.
+          TAG_TYPE_MAP = {
+              "string-array": "array",
+              "integer-array": "array",
+              "array": "array",
+              "declare-styleable": "styleable",
+          }
+
           # 1. Every name= declared anywhere inside any values/*.xml file
           #    (colors, strings, styles, attrs, ids, styleables, etc.)
           for xml_file in res.rglob("*.xml"):
@@ -393,7 +408,7 @@ jobs:
                       if rtype:
                           declared.add((rtype, name))
                   else:
-                      declared.add((tag, name))
+                      declared.add((TAG_TYPE_MAP.get(tag, tag), name))
 
           # 2. Every file inside a non-values resource directory
           #    (drawable*, mipmap*, layout*, interpolator*, anim*, ...)
@@ -432,6 +447,155 @@ jobs:
                   print(" -", r)
           else:
               print("No orphaned declarations found.")
+          PY
+
+      # ============================================================
+      # 13b. STRIP DANGLING RESOURCE REFERENCES
+      #
+      # ROOT CAUSE (build attempt #2 in the failing run): AAPT2 fails
+      # with "resource interpolator/b ... not found" and "attribute
+      # alpha ... not found". These are NOT the same class of problem
+      # as step 15/19 (raw int values needing symbolic names) -- these
+      # resources/attributes genuinely have no definition anywhere in
+      # the decompiled source tree. This happens when the *original*
+      # APK was built with resource shrinking (shrinkResources true)
+      # and the shrinker stripped an interpolator/attr's definition
+      # while leaving other XML (anim/color files, usually from a
+      # bundled ad-mediation SDK) still pointing at it. public.xml
+      # pruning (step 13) correctly removed the now-orphaned <public>
+      # entries for these -- but that doesn't fix the dangling
+      # *references* to them elsewhere in res/, which is what this
+      # step does, proactively, before AAPT2 ever runs.
+      #
+      # Two narrow, low-risk cases are handled:
+      #   1. An attribute value like "@interpolator/b" or "@color/e"
+      #      that points at a file-backed resource type (anim,
+      #      animator, color, drawable, font, interpolator, layout,
+      #      menu, mipmap, navigation, raw, transition, xml) with no
+      #      matching file anywhere under res/. The containing
+      #      attribute is dropped (the view/animation just falls back
+      #      to its default).
+      #   2. A custom-namespaced attribute (anything other than
+      #      android:/tools:/xmlns:) whose local name has no matching
+      #      <attr name="..."> declared anywhere in res/values -- e.g.
+      #      a shrunk AndroidX/AppCompat backport attribute like
+      #      ":alpha" on a <selector> <item>. The attribute is dropped.
+      # Only these two well-understood cases are touched; every other
+      # attribute is left completely untouched to minimize risk.
+      # ============================================================
+      - name: Strip dangling resource references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          res = Path("app/res")
+          public_xml_path = res / "values" / "public.xml"
+
+          declared = set()
+
+          name_tag_re = re.compile(r'<([\w.-]+)\b([^>]*)/?>')
+          attr_pair_re = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
+
+          TAG_TYPE_MAP = {
+              "string-array": "array",
+              "integer-array": "array",
+              "array": "array",
+              "declare-styleable": "styleable",
+          }
+
+          for xml_file in res.rglob("*.xml"):
+              if xml_file == public_xml_path:
+                  continue
+              try:
+                  content = xml_file.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              for m in name_tag_re.finditer(content):
+                  tag = m.group(1)
+                  attrs = dict(attr_pair_re.findall(m.group(2)))
+                  name = attrs.get("name")
+                  if not name:
+                      continue
+                  if tag == "item":
+                      rtype = attrs.get("type")
+                      if rtype:
+                          declared.add((rtype, name))
+                  else:
+                      declared.add((TAG_TYPE_MAP.get(tag, tag), name))
+
+          for entry in res.iterdir():
+              if not entry.is_dir():
+                  continue
+              if entry.name == "values" or entry.name.startswith("values-"):
+                  continue
+              rtype = entry.name.split("-")[0]
+              for f in entry.iterdir():
+                  if f.is_file():
+                      declared.add((rtype, f.stem))
+
+          # Resource types that are only ever defined by the presence of
+          # a file (as opposed to a <tag name=...> declaration in
+          # values/*.xml). These are safe to validate by simple
+          # (type, name) membership -- no tag-name-vs-type-name ambiguity.
+          FILE_BACKED_TYPES = {
+              "anim", "animator", "color", "drawable", "font",
+              "interpolator", "layout", "menu", "mipmap", "navigation",
+              "raw", "transition", "xml",
+          }
+
+          REF_RE = re.compile(
+              r'^@(?:[\w.]+:)?([a-zA-Z_][\w.]*)/([\w.]+)$'
+          )
+          ATTR_TOKEN_RE = re.compile(
+              r'([\w.\-]*:)?([\w.\-]+)\s*=\s*"([^"]*)"'
+          )
+
+          files_changed = 0
+          attrs_dropped = 0
+
+          for xml_file in res.rglob("*.xml"):
+              if xml_file == public_xml_path:
+                  continue
+              try:
+                  text = xml_file.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+
+              def attr_repl(m):
+                  global attrs_dropped
+                  prefix, local, value = m.group(1), m.group(2), m.group(3)
+                  ns = (prefix or "").rstrip(":")
+
+                  if local == "xmlns" or ns in ("xmlns", "tools"):
+                      return m.group(0)
+
+                  ref_match = REF_RE.match(value.strip())
+                  if ref_match:
+                      rtype, rname = ref_match.group(1), ref_match.group(2)
+                      if rtype in FILE_BACKED_TYPES and (rtype, rname) not in declared:
+                          attrs_dropped += 1
+                          return ""
+
+                  if ns and ns != "android" and ("attr", local) not in declared:
+                      attrs_dropped += 1
+                      return ""
+
+                  return m.group(0)
+
+              new_text = ATTR_TOKEN_RE.sub(attr_repl, text)
+
+              if new_text != text:
+                  xml_file.write_text(new_text, encoding="utf-8")
+                  files_changed += 1
+
+          print(f"Dangling-reference sweep: modified {files_changed} file(s), "
+                f"dropped {attrs_dropped} attribute(s).")
           PY
 
       # ============================================================
@@ -728,6 +892,30 @@ jobs:
               r'but got \(raw string\)\s+(?P<value>-?0[xX][0-9a-fA-F]+|-?[0-9]+)'
           )
 
+          # Second failure class seen in this pipeline: references to a
+          # resource (or a custom attribute) that has no definition
+          # anywhere in the decompiled source, typically left behind by
+          # resource shrinking in the *original* build (e.g. an
+          # ad-mediation SDK's anim/color XML still pointing at an
+          # interpolator or an AppCompat/AndroidX "alpha" attribute that
+          # got stripped). Step "Strip dangling resource references"
+          # fixes most of these proactively; these two patterns are the
+          # safety net for anything it doesn't have a file/attr rule for
+          # yet (e.g. new resource types AAPT2 encounters at link time).
+          #   W: .../res/anim/r.xml:11: error: resource interpolator/b (aka pkg:interpolator/b) not found.
+          #   W: .../res/color/e.xml:3: error: attribute alpha (aka pkg:alpha) not found.
+          RESOURCE_NOT_FOUND_RE = re.compile(
+              r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
+              r'resource\s+(?P<rtype>[\w.]+)/(?P<rname>[\w.]+)\s*'
+              r'(?:\(aka[^)]*\))?\s*not found\.?'
+          )
+
+          ATTRIBUTE_NOT_FOUND_RE = re.compile(
+              r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
+              r'attribute\s+(?P<aname>[\w.]+)\s*'
+              r'(?:\(aka[^)]*\))?\s*not found\.?'
+          )
+
 
           def fix_from_log(log_path):
               text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
@@ -736,10 +924,26 @@ jobs:
               for line in text.splitlines():
                   m = LOG_LINE_RE.search(line)
                   if m:
-                      matches.append(m.groupdict())
+                      d = m.groupdict()
+                      d["kind"] = "raw_value"
+                      matches.append(d)
+                      continue
+
+                  m = RESOURCE_NOT_FOUND_RE.search(line)
+                  if m:
+                      d = m.groupdict()
+                      d["kind"] = "resource_not_found"
+                      matches.append(d)
+                      continue
+
+                  m = ATTRIBUTE_NOT_FOUND_RE.search(line)
+                  if m:
+                      d = m.groupdict()
+                      d["kind"] = "attribute_not_found"
+                      matches.append(d)
 
               if not matches:
-                  print("No AAPT2 raw-value errors found in log.")
+                  print("No known AAPT2 error patterns found in log.")
                   return 0
 
               # Group by file so we only read/write each file once.
@@ -768,47 +972,90 @@ jobs:
                           continue
 
                       line_text = lines[idx]
-                      name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
-                      if not name_match:
-                          print(f"::warning::Could not find attribute name at "
-                                f"{file_path}:{entry['line']}; leaving untouched.")
-                          continue
+                      kind = entry["kind"]
 
-                      attr_name = name_match.group(1)
-                      category_key = entry["category"].replace(" ", "_")
+                      if kind == "raw_value":
+                          name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
+                          if not name_match:
+                              print(f"::warning::Could not find attribute name at "
+                                    f"{file_path}:{entry['line']}; leaving untouched.")
+                              continue
 
-                      try:
-                          value = parse_raw_value(entry["value"])
-                      except ValueError:
-                          value = None
+                          attr_name = name_match.group(1)
+                          category_key = entry["category"].replace(" ", "_")
 
-                      symbol = None
-                      if value is not None:
-                          symbol = resolve_symbol(attr_name, category_key, value)
+                          try:
+                              value = parse_raw_value(entry["value"])
+                          except ValueError:
+                              value = None
 
-                      if symbol is not None:
-                          new_line, n = re.subn(
-                              re.escape(entry["value"]), symbol, line_text, count=1
+                          symbol = None
+                          if value is not None:
+                              symbol = resolve_symbol(attr_name, category_key, value)
+
+                          if symbol is not None:
+                              new_line, n = re.subn(
+                                  re.escape(entry["value"]), symbol, line_text, count=1
+                              )
+                              if n:
+                                  lines[idx] = new_line
+                                  total_fixed += 1
+                                  print(f"FIXED {file_path}:{entry['line']}  "
+                                        f"{attr_name}: {entry['value']} -> {symbol}")
+                                  continue
+
+                          print(f"::warning::DROPPED unresolvable {entry['category']} value "
+                                f"at {file_path}:{entry['line']} "
+                                f"({attr_name} = {entry['value']}); "
+                                f"no symbolic mapping available, style override removed.")
+                          lines[idx] = ""
+                          total_dropped += 1
+
+                      elif kind == "resource_not_found":
+                          rtype, rname = entry["rtype"], entry["rname"]
+                          value_attr_re = re.compile(
+                              r'\s+[\w:.\-]+="[^"]*@(?:[\w.]*:)?' +
+                              re.escape(rtype) + r'/' + re.escape(rname) +
+                              r'[^"]*"'
                           )
+                          new_line, n = value_attr_re.subn("", line_text, count=1)
                           if n:
                               lines[idx] = new_line
                               total_fixed += 1
                               print(f"FIXED {file_path}:{entry['line']}  "
-                                    f"{attr_name}: {entry['value']} -> {symbol}")
+                                    f"dropped attribute referencing missing "
+                                    f"{rtype}/{rname}")
                               continue
 
-                      # Fallback: drop the whole item/line rather than fail the build.
-                      print(f"::warning::DROPPED unresolvable {entry['category']} value "
-                            f"at {file_path}:{entry['line']} "
-                            f"({attr_name} = {entry['value']}); "
-                            f"no symbolic mapping available, style override removed.")
-                      lines[idx] = ""
-                      total_dropped += 1
+                          print(f"::warning::DROPPED whole line at "
+                                f"{file_path}:{entry['line']}; could not isolate "
+                                f"the attribute referencing missing {rtype}/{rname}.")
+                          lines[idx] = ""
+                          total_dropped += 1
+
+                      elif kind == "attribute_not_found":
+                          aname = entry["aname"]
+                          attr_name_re = re.compile(
+                              r'\s+(?:[\w.\-]+:)?' + re.escape(aname) + r'="[^"]*"'
+                          )
+                          new_line, n = attr_name_re.subn("", line_text, count=1)
+                          if n:
+                              lines[idx] = new_line
+                              total_fixed += 1
+                              print(f"FIXED {file_path}:{entry['line']}  "
+                                    f"dropped unresolvable attribute {aname}")
+                              continue
+
+                          print(f"::warning::DROPPED whole line at "
+                                f"{file_path}:{entry['line']}; could not isolate "
+                                f"unresolvable attribute {aname}.")
+                          lines[idx] = ""
+                          total_dropped += 1
 
                   p.write_text("".join(lines), encoding="utf-8")
 
-              print(f"Targeted log-driven fix: {total_fixed} symbolized, "
-                    f"{total_dropped} dropped.")
+              print(f"Targeted log-driven fix: {total_fixed} fixed/dropped-attribute, "
+                    f"{total_dropped} whole-line-dropped.")
               return total_fixed + total_dropped
 
 
@@ -1079,7 +1326,7 @@ jobs:
           rm -rf build/dist
           mkdir -p build/dist
 
-          MAX_ATTEMPTS=5
+          MAX_ATTEMPTS=8
           attempt=1
           build_ok=0
 
