@@ -1,0 +1,82 @@
+name: Rebuild and Package APK
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: actions/setup-android@v3
+
+      - name: Install Android SDK Components
+        run: |
+          sdkmanager --update
+          sdkmanager "build-tools;34.0.0" "platforms;android-34" "platform-tools"
+
+      - name: Cache Apktool and Tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin
+          key: apktool-tools-${{ runner.os }}
+
+      - name: Install Apktool & Dependencies
+        run: |
+          mkdir -p ~/.local/bin
+          if [ ! -f ~/.local/bin/apktool ]; then
+            wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O ~/.local/bin/apktool
+            wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar -O ~/.local/bin/apktool.jar
+            chmod +x ~/.local/bin/apktool ~/.local/bin/apktool.jar
+          fi
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Verify Project Files & Hashes
+        run: |
+          if [ -d "project" ]; then
+            echo "Project directory found."
+          elif [ -f "project.zip" ]; then
+            echo "Unzipping project archive..."
+            unzip -q project.zip -d project
+          fi
+
+      - name: Rebuild Unsigned APK with Apktool
+        run: |
+          apktool b project -o build/unsigned_app.apk --use-aapt2
+
+      - name: Align and Sign APK
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          
+          # Align APK
+          $BUILD_TOOLS/zipalign -v 4 build/unsigned_app.apk build/aligned_app.apk
+          
+          # Generate Debug Key & Sign
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --ks-alias androiddebugkey --out build/final_signed_app.apk build/aligned_app.apk
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-apk
+          path: build/final_signed_app.apk
+          
