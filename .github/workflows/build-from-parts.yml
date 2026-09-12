@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          EXPECTED="6f8325bfeb12db2a51f98ac6246ae5ff1acb2132042a52a52a52e06cb35f4bf50e2db9"
+          EXPECTED="6f8325bfeb12db2a51f98ac6246ae5ff1acb2132042a52e06cb35f4bf50e2db9"
           ACTUAL="$(sha256sum MetaEvo_OpenFork_BuildSystem.zip | awk '{print $1}')"
 
           echo "Expected: $EXPECTED"
