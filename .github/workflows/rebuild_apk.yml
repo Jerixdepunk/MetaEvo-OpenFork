@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. CHECK ZIP PARTS (resilient SHA-256)
+      # 2. CHECK ZIP PARTS
       # ============================================================
       - name: Check ZIP parts
         shell: bash
@@ -105,7 +105,7 @@ jobs:
           ls -lh MetaEvo_OpenFork_BuildSystem.zip
 
       # ============================================================
-      # 4. VERIFY PROJECT ZIP (resilient SHA-256 + integrity test)
+      # 4. VERIFY PROJECT ZIP
       # ============================================================
       - name: Verify project ZIP
         shell: bash
@@ -177,7 +177,7 @@ jobs:
       # 7. ANDROID SDK
       # ============================================================
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: actions/setup-android@v3
 
       # ============================================================
       # 8. ANDROID BUILD TOOLS
@@ -320,7 +320,7 @@ jobs:
           java -jar tools/apktool.jar --version
 
       # ============================================================
-      # 12. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
+      # 12. PRUNE ORPHANED PUBLIC.XML DECLARATIONS
       # ============================================================
       - name: Prune orphaned public.xml declarations
         shell: bash
@@ -335,6 +335,10 @@ jobs:
 
           res = Path("app/res")
           public_xml_path = res / "values" / "public.xml"
+          if not public_xml_path.exists():
+              print("public.xml not found; nothing to prune.")
+              raise SystemExit(0)
+
           text = public_xml_path.read_text(encoding="utf-8")
 
           declared = set()
@@ -402,7 +406,12 @@ jobs:
           PY
 
       # ============================================================
-      # 13. WRITE SHARED AAPT2 RAW-VALUE SYMBOL RESOLVER
+      # 13. WRITE SHARED AAPT2 SYMBOL RESOLVER
+      #
+      # Now includes mappings for:
+      #   screenOrientation, configChanges, scaleType,
+      #   windowLayoutInDisplayCutoutMode, breakStrategy,
+      #   hyphenationFrequency, displayOptions.
       # ============================================================
       - name: Write shared AAPT2 symbol resolver
         shell: bash
@@ -414,21 +423,17 @@ jobs:
 
           cat > tools/aapt_symbol_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """
-          Shared AAPT2 raw-value -> symbolic-value resolver.
+          """Shared AAPT2 raw-value -> symbolic-value resolver.
 
           Modes:
             --scan-all              Walk every app/res/**/*.xml and symbolize any
-                                     recognized raw flags/enum/dimension-enum item,
-                                     whether or not AAPT2 has complained about it yet.
+                                     recognized raw flags/enum/dimension-enum item.
 
-            --fix-from-log LOGFILE  Parse an AAPT2/apktool build log for
+            --fix-from-log LOGFILE  Parse an AAPT2 build log for
                                      "expected (flags|enum|dimension enum) but got
                                      (raw string) VALUE" errors, and fix exactly the
                                      reported file:line. If the attribute is not
-                                     recognized, the offending <item> is dropped
-                                     instead (a missing style override is far safer
-                                     than a failed build).
+                                     recognized, the offending line is dropped.
           """
           import argparse
           import re
@@ -527,6 +532,75 @@ jobs:
               return "|".join(parts)
 
 
+          def decode_screen_orientation(value):
+              return {
+                  0: "landscape", 1: "portrait", 2: "user", 3: "behind",
+                  4: "sensor", 5: "nosensor", 6: "sensorLandscape",
+                  7: "sensorPortrait", 8: "reverseLandscape",
+                  9: "reversePortrait", 10: "fullSensor", 11: "userLandscape",
+                  12: "userPortrait", 13: "fullUser", 14: "locked",
+              }.get(value)
+
+
+          CONFIG_CHANGE_FLAGS = {
+              0x0001: "mcc", 0x0002: "mnc", 0x0004: "locale",
+              0x0008: "touchscreen", 0x0010: "keyboard", 0x0020: "keyboardHidden",
+              0x0040: "navigation", 0x0080: "orientation", 0x0100: "screenLayout",
+              0x0200: "uiMode", 0x0400: "screenSize", 0x0800: "smallestScreenSize",
+              0x1000: "density", 0x2000: "layoutDirection",
+              0x40000000: "fontScale",
+          }
+
+          def decode_config_changes(value):
+              parts = []
+              remaining = value
+              for bit in sorted(CONFIG_CHANGE_FLAGS.keys()):
+                  if value & bit:
+                      parts.append(CONFIG_CHANGE_FLAGS[bit])
+                      remaining &= ~bit
+              if remaining != 0 or not parts:
+                  return None
+              return "|".join(parts)
+
+
+          def decode_scale_type(value):
+              return {
+                  0: "matrix", 1: "fitXY", 2: "fitStart", 3: "fitCenter",
+                  4: "fitEnd", 5: "center", 6: "centerCrop", 7: "centerInside",
+              }.get(value)
+
+
+          def decode_window_layout_in_display_cutout_mode(value):
+              return {
+                  0: "default", 1: "shortEdges", 2: "never", 3: "always",
+              }.get(value)
+
+
+          def decode_break_strategy(value):
+              return {0: "simple", 1: "highQuality", 2: "balanced"}.get(value)
+
+
+          def decode_hyphenation_frequency(value):
+              return {0: "none", 1: "normal", 2: "full", 3: "normalFast", 4: "fullFast"}.get(value)
+
+
+          DISPLAY_OPTIONS_FLAGS = {
+              0x1: "showSearchIcon", 0x2: "showSearchLabel",
+              0x4: "showSearchHint", 0x8: "showSearchSuggestion",
+          }
+
+          def decode_display_options(value):
+              parts = []
+              remaining = value
+              for bit in sorted(DISPLAY_OPTIONS_FLAGS.keys()):
+                  if value & bit:
+                      parts.append(DISPLAY_OPTIONS_FLAGS[bit])
+                      remaining &= ~bit
+              if remaining != 0 or not parts:
+                  return None
+              return "|".join(parts)
+
+
           def decode_dimension_enum(value):
               return {-1: "match_parent", -2: "wrap_content"}.get(value)
 
@@ -536,6 +610,8 @@ jobs:
               "layout_gravity": decode_gravity,
               "windowSoftInputMode": decode_window_soft_input_mode,
               "textStyle": decode_text_style,
+              "configChanges": decode_config_changes,
+              "displayOptions": decode_display_options,
           }
 
           DIMENSION_ENUM_ATTRS = {"layout_width", "layout_height"}
@@ -556,6 +632,11 @@ jobs:
                   3: "actionSearch", 4: "actionSend", 5: "actionNext",
                   6: "actionDone", 7: "actionPrevious",
               },
+              "screenOrientation": None,  # handled via decoder
+              "scaleType": None,
+              "windowLayoutInDisplayCutoutMode": None,
+              "breakStrategy": None,
+              "hyphenationFrequency": None,
           }
 
 
@@ -585,6 +666,16 @@ jobs:
                   return None
 
               if category == "enum":
+                  if short_name == "screenOrientation":
+                      return decode_screen_orientation(value)
+                  if short_name == "scaleType":
+                      return decode_scale_type(value)
+                  if short_name == "windowLayoutInDisplayCutoutMode":
+                      return decode_window_layout_in_display_cutout_mode(value)
+                  if short_name == "breakStrategy":
+                      return decode_break_strategy(value)
+                  if short_name == "hyphenationFrequency":
+                      return decode_hyphenation_frequency(value)
                   table = ENUM_TABLES.get(short_name)
                   if table:
                       return table.get(value)
@@ -631,6 +722,16 @@ jobs:
                           symbol = decode_dimension_enum(value)
                       elif short_name in FLAG_DECODERS:
                           symbol = FLAG_DECODERS[short_name](value)
+                      elif short_name == "screenOrientation":
+                          symbol = decode_screen_orientation(value)
+                      elif short_name == "scaleType":
+                          symbol = decode_scale_type(value)
+                      elif short_name == "windowLayoutInDisplayCutoutMode":
+                          symbol = decode_window_layout_in_display_cutout_mode(value)
+                      elif short_name == "breakStrategy":
+                          symbol = decode_break_strategy(value)
+                      elif short_name == "hyphenationFrequency":
+                          symbol = decode_hyphenation_frequency(value)
                       elif short_name in ENUM_TABLES:
                           symbol = ENUM_TABLES[short_name].get(value)
 
@@ -766,7 +867,169 @@ jobs:
           echo "Shared resolver written to tools/aapt_symbol_fix.py"
 
       # ============================================================
-      # 14. PROACTIVE RAW-VALUE REPAIR PASS
+      # 14. WRITE SMALI REGISTER FIX SCRIPT
+      # ============================================================
+      - name: Write smali register fix script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          mkdir -p tools
+
+          cat > tools/smali_register_fix.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Fix smali register errors from a Gradle/Apktool build log.
+
+          Parses lines like:
+          app/smali_classes5/.../oOO00OO0Oo0.smali[298,4] This method requires at least 2 registers, for the method parameters
+
+          and increases the .locals (or .registers) directive in that method.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          LOG_RE = re.compile(
+              r'(?P<file>\S+\.smali)\[(?P<line>\d+),\d+\]\s+'
+              r'This method requires at least (?P<needed>\d+) registers'
+          )
+
+          LOCALS_RE = re.compile(r'^\s*\.locals\s+(\d+)')
+          REGISTERS_RE = re.compile(r'^\s*\.registers\s+(\d+)')
+
+
+          def fix_from_log(log_path):
+              text = Path(log_path).read_text(encoding='utf-8', errors='ignore')
+              matches = []
+              for line in text.splitlines():
+                  m = LOG_RE.search(line)
+                  if m:
+                      matches.append(m.groupdict())
+
+              if not matches:
+                  print("No smali register errors found in log.")
+                  return 0
+
+              by_file = {}
+              for m in matches:
+                  by_file.setdefault(m['file'], []).append(m)
+
+              total_fixed = 0
+              for file_path, entries in by_file.items():
+                  p = Path(file_path)
+                  if not p.is_file():
+                      print(f"::warning::Could not find {file_path}")
+                      continue
+                  lines = p.read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
+                  modified = False
+                  for entry in entries:
+                      line_idx = int(entry['line']) - 1
+                      needed = int(entry['needed'])
+                      for i in range(line_idx, -1, -1):
+                          locals_m = LOCALS_RE.match(lines[i])
+                          registers_m = REGISTERS_RE.match(lines[i])
+                          if locals_m:
+                              current = int(locals_m.group(1))
+                              if current < needed:
+                                  new_val = needed + 1
+                                  lines[i] = f'.locals {new_val}\n'
+                                  total_fixed += 1
+                                  modified = True
+                                  print(f"FIXED {file_path}: .locals {current} -> {new_val} (line {i+1})")
+                              break
+                          if registers_m:
+                              current = int(registers_m.group(1))
+                              if current < needed:
+                                  new_val = needed + 1
+                                  lines[i] = f'.registers {new_val}\n'
+                                  total_fixed += 1
+                                  modified = True
+                                  print(f"FIXED {file_path}: .registers {current} -> {new_val} (line {i+1})")
+                              break
+                      else:
+                          print(f"::warning::No .locals/.registers found before line {entry['line']} in {file_path}")
+                  if modified:
+                      p.write_text(''.join(lines), encoding='utf-8')
+              return total_fixed
+
+
+          def main():
+              log_path = sys.argv[1] if len(sys.argv) > 1 else None
+              if not log_path:
+                  print("Usage: smali_register_fix.py <build-log>")
+                  return 0
+              changed = fix_from_log(log_path)
+              if changed == 0:
+                  sys.exit(2)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+          chmod +x tools/smali_register_fix.py
+          echo "Smali register fix written to tools/smali_register_fix.py"
+
+      # ============================================================
+      # 15. WRITE ALPHA ATTR FIX SCRIPT
+      # ============================================================
+      - name: Write alpha attr fix script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          mkdir -p tools
+
+          cat > tools/attrs_alpha_fix.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Ensure <attr name="alpha" format="float"/> exists in app/res/values/attrs.xml."""
+          import sys
+          from pathlib import Path
+
+          ATTRS_PATH = Path("app/res/values/attrs.xml")
+
+
+          def main():
+              if ATTRS_PATH.exists():
+                  text = ATTRS_PATH.read_text(encoding='utf-8')
+                  if 'name="alpha"' in text:
+                      print("alpha attr already present.")
+                      return 0
+                  if '</resources>' in text:
+                      text = text.replace(
+                          '</resources>',
+                          '    <attr name="alpha" format="float"/>\n</resources>'
+                      )
+                  else:
+                      text += '\n<attr name="alpha" format="float"/>\n'
+                  ATTRS_PATH.write_text(text, encoding='utf-8')
+                  print("Added alpha attr to existing attrs.xml")
+                  return 1
+              else:
+                  ATTRS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                  ATTRS_PATH.write_text(
+                      '<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<resources>\n'
+                      '    <attr name="alpha" format="float"/>\n'
+                      '</resources>\n',
+                      encoding='utf-8'
+                  )
+                  print("Created attrs.xml with alpha attr")
+                  return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(0 if main() == 0 else 0)
+          PYEOF
+
+          chmod +x tools/attrs_alpha_fix.py
+          echo "Alpha attr fix written to tools/attrs_alpha_fix.py"
+
+      # ============================================================
+      # 16. REPAIR RAW AAPT2 SYMBOLIC ATTRIBUTE VALUES (proactive)
       # ============================================================
       - name: Repair raw AAPT2 symbolic attribute values
         shell: bash
@@ -778,7 +1041,7 @@ jobs:
           python3 tools/aapt_symbol_fix.py --scan-all
 
       # ============================================================
-      # 15. REPAIR MALFORMED 9-PATCH RESOURCES
+      # 17. REPAIR MALFORMED 9-PATCH RESOURCES
       # ============================================================
       - name: Repair malformed 9-patch resources
         shell: bash
@@ -952,12 +1215,7 @@ jobs:
           PY
 
       # ============================================================
-      # 16. VERIFY SOURCE STRUCTURE
-      #
-      # Runs on the PRISTINE extracted tree (before the smali split
-      # mutates file counts). tools/verify-source.sh has a
-      # hard-coded expected smali class count; running this after
-      # the split would trip that check.
+      # 18. VERIFY SOURCE STRUCTURE
       # ============================================================
       - name: Verify source structure
         shell: bash
@@ -969,16 +1227,7 @@ jobs:
           ./tools/verify-source.sh
 
       # ============================================================
-      # 17. REPAIR MERGED SMALI SOURCES
-      #
-      # Some decompiled .smali files contain TWO OR MORE concatenated
-      # classes (several '.class' directives). Smali then aborts with
-      # "missing EOF at '.class'" and the whole build fails. This
-      # step splits every multi-class file into one file per class,
-      # then re-validates that no merged file remains.
-      #
-      # NOTE: this step INCREASES the .smali file count, which is
-      # why it runs AFTER "Verify source structure" (step 16).
+      # 19. REPAIR MERGED SMALI SOURCES
       # ============================================================
       - name: Repair merged smali sources
         shell: bash
@@ -1003,7 +1252,7 @@ jobs:
               if len(starts) <= 1:
                   return 0
 
-              header = lines[: starts[0]]  # leading comments -> first class
+              header = lines[: starts[0]]
               created, seen = 0, set()
               for n, s in enumerate(starts):
                   end = starts[n + 1] if n + 1 < len(starts) else len(lines)
@@ -1014,7 +1263,7 @@ jobs:
                   if not descriptor.startswith("L"):
                       print(f"!! unparseable .class line in {path}:{s+1}", file=sys.stderr)
                       continue
-                  rel = descriptor[1:] + ".smali"  # Lcom/foo/Bar; -> com/foo/Bar.smali
+                  rel = descriptor[1:] + ".smali"
                   if rel in seen:
                       print(f"!! duplicate class {descriptor} in {path} - keeping first", file=sys.stderr)
                       continue
@@ -1024,7 +1273,7 @@ jobs:
                   out.write_text("".join(block), encoding="utf-8")
                   created += 1
 
-              path.unlink()  # merged original is invalid once split
+              path.unlink()
               print(f"split: {path} -> {created} class file(s)")
               return created
 
@@ -1084,7 +1333,7 @@ jobs:
           find app -path '*/smali*' -type f -name '*.smali' | wc -l
 
       # ============================================================
-      # 18. SHOW GRADLE VERSION
+      # 20. SHOW GRADLE VERSION
       # ============================================================
       - name: Show Gradle version
         shell: bash
@@ -1097,7 +1346,14 @@ jobs:
           ./gradlew --version --no-daemon
 
       # ============================================================
-      # 19. BUILD UNSIGNED APK (SELF-HEALING)
+      # 21. BUILD UNSIGNED APK (SELF-HEALING)
+      #
+      # Now runs FOUR repair scripts each retry:
+      #   1. aapt_symbol_fix.py    --fix-from-log
+      #   2. smali_split_fix.py    app
+      #   3. smali_register_fix.py --fix-from-log
+      #   4. attrs_alpha_fix.py
+      # Aborts early only if NONE of them changed anything.
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -1141,23 +1397,38 @@ jobs:
 
             echo "Attempting automatic repair..."
 
-            # 1) AAPT2 raw enum/flags values (styles.xml etc.)
+            # 1) AAPT2 raw enum/flags values
             set +e
             python3 tools/aapt_symbol_fix.py --fix-from-log "$LOG_FILE"
             fix_status=$?
             set -e
 
-            # 2) Merged smali files ("missing EOF at '.class'")
+            # 2) Merged smali files
             set +e
             python3 tools/smali_split_fix.py app
             smali_status=$?
             set -e
 
+            # 3) Smali register-too-small errors
+            set +e
+            python3 tools/smali_register_fix.py "$LOG_FILE"
+            reg_status=$?
+            set -e
+
+            # 4) Missing alpha attr
+            set +e
+            python3 tools/attrs_alpha_fix.py
+            alpha_status=$?
+            set -e
+
             # Only give up when NEITHER repair changed anything
-            if [ "$fix_status" -eq 2 ] && [ "$smali_status" -eq 0 ]; then
+            if [ "$fix_status" -eq 2 ] && [ "$smali_status" -eq 0 ] && \
+               [ "$reg_status" -eq 2 ] && [ "$alpha_status" -eq 0 ]; then
               echo "::error::Build failed and no known repair pattern changed anything."
               echo "  - aapt_symbol_fix.py: no AAPT2 raw-value pattern (exit 2)"
               echo "  - smali_split_fix.py: no merged smali files (exit 0)"
+              echo "  - smali_register_fix.py: no register errors (exit 2)"
+              echo "  - attrs_alpha_fix.py: alpha attr already present (exit 0)"
               echo "Full log of failed attempt:"
               cat "$LOG_FILE"
               exit 1
@@ -1186,7 +1457,7 @@ jobs:
           cp "$APK" "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
 
       # ============================================================
-      # 20. ZIPALIGN
+      # 22. ZIPALIGN
       # ============================================================
       - name: Zipalign APK
         shell: bash
@@ -1205,7 +1476,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
       # ============================================================
-      # 21. SIGN APK (ephemeral debug keystore)
+      # 23. SIGN APK (ephemeral debug keystore)
       # ============================================================
       - name: Sign APK (ephemeral debug keystore)
         shell: bash
@@ -1246,7 +1517,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
 
       # ============================================================
-      # 22. CHECKSUMS
+      # 24. CHECKSUMS
       # ============================================================
       - name: Generate checksums
         shell: bash
@@ -1264,7 +1535,7 @@ jobs:
           cat MetaEvo-OpenFork-checksums.sha256
 
       # ============================================================
-      # 23. UPLOAD ARTIFACTS
+      # 25. UPLOAD ARTIFACTS
       # ============================================================
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -1279,7 +1550,7 @@ jobs:
           retention-days: 14
 
       # ============================================================
-      # 24. UPLOAD BUILD LOGS ON FAILURE
+      # 26. UPLOAD BUILD LOGS ON FAILURE
       # ============================================================
       - name: Upload build logs on failure
         if: failure()
