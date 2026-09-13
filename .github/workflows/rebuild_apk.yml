@@ -29,29 +29,20 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # 1. CHECKOUT
-      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================================
-      # 2. CHECK ZIP PARTS
-      # ============================================================
       - name: Check ZIP parts
         shell: bash
         run: |
           set -euo pipefail
-
           PARTS="MetaEvo_OpenFork_BuildSystem.zip.part-aa MetaEvo_OpenFork_BuildSystem.zip.part-ab MetaEvo_OpenFork_BuildSystem.zip.part-ac"
-
           for f in $PARTS; do
             if [ ! -f "$f" ]; then
               echo "::error::Missing required file: $f"
               exit 1
             fi
           done
-
           echo "All ZIP parts found."
           ls -lh $PARTS
 
@@ -60,154 +51,94 @@ jobs:
             [MetaEvo_OpenFork_BuildSystem.zip.part-ab]="00f7ffdfae415401a3b6714b42309e5aa605c3d4dff7a1b806c938eb1647abe6"
             [MetaEvo_OpenFork_BuildSystem.zip.part-ac]="d4fc4c210adfed9b5c6870a309d98cce89ece417f8b699313d7a280cac269756"
           )
-
           mismatch=0
           for f in $PARTS; do
             actual="$(sha256sum "$f" | awk '{print $1}')"
             expected="${EXPECTED_SHA[$f]}"
-            echo
-            echo "File:     $f"
-            echo "Expected: $expected"
-            echo "Actual:   $actual"
+            echo; echo "File:     $f"; echo "Expected: $expected"; echo "Actual:   $actual"
             if [ "$actual" != "$expected" ]; then
               mismatch=1
               echo "::warning::SHA-256 mismatch for $f"
-              echo "To fix, update the hash in the 'Check ZIP parts' step to:"
               echo "  [$f]=\"$actual\""
             else
               echo "SHA-256 OK: $f"
             fi
           done
-
           if [ "$mismatch" -ne 0 ]; then
             if [ "${STRICT_HASH_CHECK:-false}" = "true" ]; then
-              echo "::error::SHA-256 mismatch (strict_hash_check enabled)."
-              exit 1
+              echo "::error::SHA-256 mismatch (strict_hash_check enabled)."; exit 1
             fi
             echo "::warning::Hash mismatch(es) ignored (strict mode off). Continuing."
           fi
 
-      # ============================================================
-      # 3. REASSEMBLE PROJECT ZIP
-      # ============================================================
       - name: Reassemble project ZIP
         shell: bash
         run: |
           set -euo pipefail
-
           cat \
             MetaEvo_OpenFork_BuildSystem.zip.part-aa \
             MetaEvo_OpenFork_BuildSystem.zip.part-ab \
             MetaEvo_OpenFork_BuildSystem.zip.part-ac \
             > MetaEvo_OpenFork_BuildSystem.zip
-
-          echo "Reassembled ZIP:"
           ls -lh MetaEvo_OpenFork_BuildSystem.zip
 
-      # ============================================================
-      # 4. VERIFY PROJECT ZIP
-      # ============================================================
       - name: Verify project ZIP
         shell: bash
         run: |
           set -euo pipefail
-
           EXPECTED="6f8325bfeb12db2a51f98ac6246ae5ff1acb2132042a52e06cb35f4bf50e2db9"
           ACTUAL="$(sha256sum MetaEvo_OpenFork_BuildSystem.zip | awk '{print $1}')"
-
-          echo "Expected SHA-256: $EXPECTED"
-          echo "Actual SHA-256:   $ACTUAL"
-
+          echo "Expected: $EXPECTED"; echo "Actual:   $ACTUAL"
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             if [ "${STRICT_HASH_CHECK:-false}" = "true" ]; then
-              echo "::error::ZIP checksum mismatch (strict_hash_check enabled)."
-              exit 1
+              echo "::error::ZIP checksum mismatch (strict mode)."; exit 1
             fi
-            echo "::warning::ZIP checksum mismatch ignored (strict mode off)."
-            echo "To re-enable strict checking, set EXPECTED in this step to: $ACTUAL"
+            echo "::warning::ZIP checksum mismatch ignored (strict off)."
+            echo "Set EXPECTED to: $ACTUAL"
           else
             echo "ZIP checksum verified."
           fi
-
-          echo "Testing ZIP integrity..."
           unzip -t MetaEvo_OpenFork_BuildSystem.zip
           echo "ZIP integrity verified."
 
-      # ============================================================
-      # 5. EXTRACT PROJECT
-      # ============================================================
       - name: Extract project
         shell: bash
         run: |
           set -euo pipefail
-
-          rm -rf extracted
-          mkdir -p extracted
-
+          rm -rf extracted; mkdir -p extracted
           unzip -q MetaEvo_OpenFork_BuildSystem.zip -d extracted
-
           PROJECT_DIR="$(
-            find "$GITHUB_WORKSPACE/extracted" \
-              -type f \
-              -name settings.gradle.kts \
-              -print -quit |
-              xargs -r dirname
+            find "$GITHUB_WORKSPACE/extracted" -type f -name settings.gradle.kts -print -quit | xargs -r dirname
           )"
-
           if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::settings.gradle.kts was not found."
-            exit 1
+            echo "::error::settings.gradle.kts not found."; exit 1
           fi
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Project directory:"
           echo "$PROJECT_DIR"
 
-      # ============================================================
-      # 6. JAVA 17
-      # ============================================================
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # ============================================================
-      # 7. ANDROID SDK
-      # ============================================================
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # ============================================================
-      # 8. ANDROID BUILD TOOLS
-      # ============================================================
       - name: Install Android build tools
         shell: bash
         run: |
           set -euo pipefail
-
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-          sdkmanager \
-            "platform-tools" \
-            "build-tools;35.0.0"
-
+          sdkmanager "platform-tools" "build-tools;35.0.0"
           test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
           test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
 
-          echo "Android build tools verified."
-
-      # ============================================================
-      # 9. VERIFY PROJECT FILES
-      # ============================================================
       - name: Verify project files
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           test -f settings.gradle.kts
           test -f build.gradle.kts
           test -f gradlew
@@ -215,462 +146,252 @@ jobs:
           test -f app/apktool.yml
           test -f tools/bootstrap-apktool.sh
           test -f tools/verify-source.sh
-
-          chmod +x gradlew
-          chmod +x tools/bootstrap-apktool.sh
-          chmod +x tools/verify-source.sh
-
-          echo "Project files verified."
-
+          chmod +x gradlew tools/bootstrap-apktool.sh tools/verify-source.sh
           echo "Smali class count (pre-split):"
-          find app \
-            -path '*/smali*' \
-            -type f \
-            -name '*.smali' |
-            wc -l
+          find app -path '*/smali*' -type f -name '*.smali' | wc -l
 
-      # ============================================================
-      # 10. NORMALIZE APKTOOL METADATA
-      # ============================================================
       - name: Normalize Apktool metadata
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
-          echo "Apktool metadata before normalization:"
-          grep -nE '^[[:space:]]*version(Code|Name):' \
-            app/apktool.yml || true
-
           python3 <<'PY'
           from pathlib import Path
           import re
-
           path = Path("app/apktool.yml")
           text = path.read_text(encoding="utf-8")
-
           original = text
-
-          pattern = re.compile(
-              r'^(\s*versionCode:\s*)(["\'])([0-9]+)\2(\s*)$',
-              re.MULTILINE
-          )
-
-          text = pattern.sub(
-              lambda m: f"{m.group(1)}{m.group(3)}{m.group(4)}",
-              text
-          )
-
+          pattern = re.compile(r'^(\s*versionCode:\s*)(["\'])([0-9]+)\2(\s*)$', re.MULTILINE)
+          text = pattern.sub(lambda m: f"{m.group(1)}{m.group(3)}{m.group(4)}", text)
           if text != original:
               path.write_text(text, encoding="utf-8")
               print("Quoted versionCode normalized.")
-          else:
-              print("No quoted versionCode required normalization.")
-
-          match = re.search(
-              r'^\s*versionCode:\s*([0-9]+)\s*$',
-              text,
-              re.MULTILINE
-          )
-
-          if not match:
-              raise SystemExit(
-                  "ERROR: versionCode is missing or is not numeric."
-              )
-
-          print("Validated versionCode:", match.group(1))
+          m = re.search(r'^\s*versionCode:\s*([0-9]+)\s*$', text, re.MULTILINE)
+          if not m:
+              raise SystemExit("ERROR: versionCode missing or non-numeric.")
+          print("Validated versionCode:", m.group(1))
           PY
 
-          echo "Apktool metadata after normalization:"
-          grep -nE '^[[:space:]]*version(Code|Name):' \
-            app/apktool.yml || true
-
-      # ============================================================
-      # 11. BOOTSTRAP APKTOOL 3.0.3
-      # ============================================================
       - name: Bootstrap Apktool 3.0.3
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
           APKTOOL_SHA256="dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
-
-          mkdir -p tools
-          rm -f tools/apktool.jar
-
-          curl \
-            -fL \
-            --retry 5 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            -o tools/apktool.jar \
-            "$APKTOOL_URL"
-
+          mkdir -p tools; rm -f tools/apktool.jar
+          curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o tools/apktool.jar "$APKTOOL_URL"
           test -s tools/apktool.jar
-
-          echo "$APKTOOL_SHA256  tools/apktool.jar" |
-            sha256sum -c -
-
-          echo "Apktool SHA-256 verified."
-
+          echo "$APKTOOL_SHA256  tools/apktool.jar" | sha256sum -c -
           java -jar tools/apktool.jar --version
 
-      # ============================================================
-      # 12. PRUNE ORPHANED PUBLIC.XML DECLARATIONS
-      # ============================================================
       - name: Prune orphaned public.xml declarations
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           python3 <<'PY'
           from pathlib import Path
           import re
-
           res = Path("app/res")
           public_xml_path = res / "values" / "public.xml"
-
           if not public_xml_path.exists():
-              print("public.xml not found; skipping prune.")
+              print("public.xml not found; skipping.")
               raise SystemExit(0)
-
           text = public_xml_path.read_text(encoding="utf-8")
-
           declared = set()
-
           name_tag_re = re.compile(r'<([\w.-]+)\b([^>]*)/?>')
           attr_pair_re = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
-
           for xml_file in res.rglob("*.xml"):
-              if xml_file == public_xml_path:
-                  continue
-              try:
-                  content = xml_file.read_text(encoding="utf-8", errors="ignore")
-              except Exception:
-                  continue
+              if xml_file == public_xml_path: continue
+              try: content = xml_file.read_text(encoding="utf-8", errors="ignore")
+              except Exception: continue
               for m in name_tag_re.finditer(content):
-                  tag = m.group(1)
-                  attrs = dict(attr_pair_re.findall(m.group(2)))
+                  tag = m.group(1); attrs = dict(attr_pair_re.findall(m.group(2)))
                   name = attrs.get("name")
-                  if not name:
-                      continue
+                  if not name: continue
                   if tag == "item":
                       rtype = attrs.get("type")
-                      if rtype:
-                          declared.add((rtype, name))
+                      if rtype: declared.add((rtype, name))
                   else:
                       declared.add((tag, name))
-
           for entry in res.iterdir():
-              if not entry.is_dir():
-                  continue
-              if entry.name == "values" or entry.name.startswith("values-"):
-                  continue
+              if not entry.is_dir(): continue
+              if entry.name == "values" or entry.name.startswith("values-"): continue
               rtype = entry.name.split("-")[0]
               for f in entry.iterdir():
-                  if f.is_file():
-                      declared.add((rtype, f.stem))
-
-          def resource_exists(rtype, name):
-              return (rtype, name) in declared
-
+                  if f.is_file(): declared.add((rtype, f.stem))
+          def resource_exists(rtype, name): return (rtype, name) in declared
           pattern = re.compile(r'<public\s+([^>]*?)/>', re.DOTALL)
-
           removed = []
-
           def repl(m):
               attrs = dict(attr_pair_re.findall(m.group(1)))
-              rtype = attrs.get("type")
-              name = attrs.get("name")
+              rtype = attrs.get("type"); name = attrs.get("name")
               if rtype and name and not resource_exists(rtype, name):
-                  removed.append(f"{rtype}/{name}")
-                  return ""
+                  removed.append(f"{rtype}/{name}"); return ""
               return m.group(0)
-
           new_text = pattern.sub(repl, text)
-
           if removed:
               public_xml_path.write_text(new_text, encoding="utf-8")
-              print(f"Removed {len(removed)} orphaned public.xml declarations:")
-              for r in removed:
-                  print(" -", r)
+              print(f"Removed {len(removed)} orphaned declarations.")
           else:
               print("No orphaned declarations found.")
           PY
 
       # ============================================================
-      # 13. WRITE SHARED AAPT2 SYMBOL RESOLVER
+      # WRITE SHARED AAPT2 SYMBOL RESOLVER (raw enum/flags values)
       # ============================================================
       - name: Write shared AAPT2 symbol resolver
         shell: bash
         run: |
           set -euo pipefail
-
-          cd "$PROJECT_DIR"
-          mkdir -p tools
-
+          cd "$PROJECT_DIR"; mkdir -p tools
           cat > tools/aapt_symbol_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Shared AAPT2 raw-value -> symbolic-value resolver."""
-          import argparse
-          import re
-          import sys
+          import argparse, re, sys
           from pathlib import Path
-
           RES_ROOT = Path("app/res")
 
           def decode_gravity(value):
-              RELATIVE = 0x800000
-              relative = bool(value & RELATIVE)
-              v = value & ~RELATIVE
+              RELATIVE = 0x800000; relative = bool(value & RELATIVE); v = value & ~RELATIVE
               EXACT = {0x11: "center", 0x77: "fill"}
               VMASK = {0x70: "fill_vertical", 0x50: "bottom", 0x30: "top", 0x10: "center_vertical"}
               HMASK = {0x07: "fill_horizontal", 0x05: "right", 0x03: "left", 0x01: "center_horizontal"}
-              if v in EXACT and not relative:
-                  return EXACT[v]
-              parts = []
-              remaining = v
+              if v in EXACT and not relative: return EXACT[v]
+              parts, remaining = [], v
               vmask = v & 0x70
-              if vmask in VMASK:
-                  parts.append(VMASK[vmask])
-                  remaining &= ~0x70
+              if vmask in VMASK: parts.append(VMASK[vmask]); remaining &= ~0x70
               hmask = v & 0x07
               if hmask in HMASK:
                   name = HMASK[hmask]
-                  if relative:
-                      name = {"left": "start", "right": "end"}.get(name, name)
-                  parts.append(name)
-                  remaining &= ~0x07
-              if v & 0x80:
-                  parts.append("clip_vertical")
-                  remaining &= ~0x80
-              if v & 0x08:
-                  parts.append("clip_horizontal")
-                  remaining &= ~0x08
-              if remaining != 0 or not parts:
-                  return None
+                  if relative: name = {"left":"start","right":"end"}.get(name, name)
+                  parts.append(name); remaining &= ~0x07
+              if v & 0x80: parts.append("clip_vertical"); remaining &= ~0x80
+              if v & 0x08: parts.append("clip_horizontal"); remaining &= ~0x08
+              if remaining != 0 or not parts: return None
               return "|".join(parts)
-
 
           def decode_window_soft_input_mode(value):
-              if value < 0 or value & ~0xFF:
-                  return None
-              STATE = {0: "stateUnspecified", 1: "stateUnchanged", 2: "stateHidden",
-                       3: "stateAlwaysHidden", 4: "stateVisible", 5: "stateAlwaysVisible"}
-              ADJUST = {0x00: "adjustUnspecified", 0x10: "adjustResize",
-                        0x20: "adjustPan", 0x30: "adjustNothing"}
-              state_bits = value & 0x0F
-              adjust_bits = value & 0xF0
-              if state_bits not in STATE or adjust_bits not in ADJUST:
-                  return None
-              if value == 0:
-                  return "stateUnspecified"
+              if value < 0 or value & ~0xFF: return None
+              STATE = {0:"stateUnspecified",1:"stateUnchanged",2:"stateHidden",3:"stateAlwaysHidden",4:"stateVisible",5:"stateAlwaysVisible"}
+              ADJUST = {0x00:"adjustUnspecified",0x10:"adjustResize",0x20:"adjustPan",0x30:"adjustNothing"}
+              sb = value & 0x0F; ab = value & 0xF0
+              if sb not in STATE or ab not in ADJUST: return None
+              if value == 0: return "stateUnspecified"
               parts = []
-              if state_bits != 0:
-                  parts.append(STATE[state_bits])
-              if adjust_bits != 0:
-                  parts.append(ADJUST[adjust_bits])
-              if not parts:
-                  parts.append("stateUnspecified")
+              if sb != 0: parts.append(STATE[sb])
+              if ab != 0: parts.append(ADJUST[ab])
+              if not parts: parts.append("stateUnspecified")
               return "|".join(parts)
-
 
           def decode_text_style(value):
-              if value == 0:
-                  return "normal"
+              if value == 0: return "normal"
               parts = []
-              if value & 1:
-                  parts.append("bold")
-              if value & 2:
-                  parts.append("italic")
+              if value & 1: parts.append("bold")
+              if value & 2: parts.append("italic")
               remaining = value & ~0x3
-              if remaining != 0 or not parts:
-                  return None
+              if remaining != 0 or not parts: return None
               return "|".join(parts)
-
 
           def decode_screen_orientation(value):
-              return {0: "landscape", 1: "portrait", 2: "user", 3: "behind",
-                      4: "sensor", 5: "nosensor", 6: "sensorLandscape",
-                      7: "sensorPortrait", 8: "reverseLandscape",
-                      9: "reversePortrait", 10: "fullSensor", 11: "userLandscape",
-                      12: "userPortrait", 13: "fullUser", 14: "locked"}.get(value)
+              return {0:"landscape",1:"portrait",2:"user",3:"behind",4:"sensor",5:"nosensor",6:"sensorLandscape",
+                      7:"sensorPortrait",8:"reverseLandscape",9:"reversePortrait",10:"fullSensor",11:"userLandscape",
+                      12:"userPortrait",13:"fullUser",14:"locked"}.get(value)
 
-
-          CONFIG_CHANGE_FLAGS = {
-              0x0001: "mcc", 0x0002: "mnc", 0x0004: "locale",
-              0x0008: "touchscreen", 0x0010: "keyboard", 0x0020: "keyboardHidden",
-              0x0040: "navigation", 0x0080: "orientation", 0x0100: "screenLayout",
-              0x0200: "uiMode", 0x0400: "screenSize", 0x0800: "smallestScreenSize",
-              0x1000: "density", 0x2000: "layoutDirection", 0x40000000: "fontScale",
-          }
-
+          CONFIG_CHANGE_FLAGS = {0x0001:"mcc",0x0002:"mnc",0x0004:"locale",0x0008:"touchscreen",0x0010:"keyboard",
+                                 0x0020:"keyboardHidden",0x0040:"navigation",0x0080:"orientation",0x0100:"screenLayout",
+                                 0x0200:"uiMode",0x0400:"screenSize",0x0800:"smallestScreenSize",0x1000:"density",
+                                 0x2000:"layoutDirection",0x40000000:"fontScale"}
           def decode_config_changes(value):
-              parts = []
-              remaining = value
+              parts, remaining = [], value
               for bit in sorted(CONFIG_CHANGE_FLAGS.keys()):
-                  if value & bit:
-                      parts.append(CONFIG_CHANGE_FLAGS[bit])
-                      remaining &= ~bit
-              if remaining != 0 or not parts:
-                  return None
+                  if value & bit: parts.append(CONFIG_CHANGE_FLAGS[bit]); remaining &= ~bit
+              if remaining != 0 or not parts: return None
               return "|".join(parts)
-
 
           def decode_scale_type(value):
-              return {0: "matrix", 1: "fitXY", 2: "fitStart", 3: "fitCenter",
-                      4: "fitEnd", 5: "center", 6: "centerCrop", 7: "centerInside"}.get(value)
-
-
+              return {0:"matrix",1:"fitXY",2:"fitStart",3:"fitCenter",4:"fitEnd",5:"center",6:"centerCrop",7:"centerInside"}.get(value)
           def decode_window_layout_in_display_cutout_mode(value):
-              return {0: "default", 1: "shortEdges", 2: "never", 3: "always"}.get(value)
-
-
+              return {0:"default",1:"shortEdges",2:"never",3:"always"}.get(value)
           def decode_break_strategy(value):
-              return {0: "simple", 1: "high_quality", 2: "balanced"}.get(value)
-
-
+              return {0:"simple",1:"high_quality",2:"balanced"}.get(value)
           def decode_hyphenation_frequency(value):
-              return {0: "none", 1: "normal", 2: "full"}.get(value)
+              return {0:"none",1:"normal",2:"full"}.get(value)
 
-
-          DISPLAY_OPTIONS_FLAGS = {
-              0x1: "useLogo", 0x2: "showHome", 0x4: "homeAsUp",
-              0x8: "showTitle", 0x10: "showCustom", 0x20: "disableHome",
-          }
-
+          DISPLAY_OPTIONS_FLAGS = {0x1:"useLogo",0x2:"showHome",0x4:"homeAsUp",0x8:"showTitle",0x10:"showCustom",0x20:"disableHome"}
           def decode_display_options(value):
-              if value == 0:
-                  return "none"
-              parts = []
-              remaining = value
+              if value == 0: return "none"
+              parts, remaining = [], value
               for bit in sorted(DISPLAY_OPTIONS_FLAGS.keys()):
-                  if value & bit:
-                      parts.append(DISPLAY_OPTIONS_FLAGS[bit])
-                      remaining &= ~bit
-              if remaining != 0 or not parts:
-                  return None
+                  if value & bit: parts.append(DISPLAY_OPTIONS_FLAGS[bit]); remaining &= ~bit
+              if remaining != 0 or not parts: return None
               return "|".join(parts)
 
-
           def decode_dimension_enum(value):
-              return {-1: "match_parent", -2: "wrap_content"}.get(value)
+              return {-1:"match_parent",-2:"wrap_content"}.get(value)
 
-
-          FLAG_DECODERS = {
-              "gravity": decode_gravity,
-              "layout_gravity": decode_gravity,
-              "windowSoftInputMode": decode_window_soft_input_mode,
-              "textStyle": decode_text_style,
-              "configChanges": decode_config_changes,
-              "displayOptions": decode_display_options,
-          }
-
-          DIMENSION_ENUM_ATTRS = {"layout_width", "layout_height"}
-
+          FLAG_DECODERS = {"gravity":decode_gravity,"layout_gravity":decode_gravity,
+                           "windowSoftInputMode":decode_window_soft_input_mode,"textStyle":decode_text_style,
+                           "configChanges":decode_config_changes,"displayOptions":decode_display_options}
+          DIMENSION_ENUM_ATTRS = {"layout_width","layout_height"}
           ENUM_TABLES = {
-              "orientation": {0: "horizontal", 1: "vertical"},
-              "visibility": {0: "visible", 1: "invisible", 2: "gone"},
-              "textAlignment": {0: "inherit", 1: "gravity", 2: "textStart",
-                                3: "textEnd", 4: "center", 5: "viewStart", 6: "viewEnd"},
-              "layoutDirection": {0: "ltr", 1: "rtl", 2: "locale", 3: "inherit"},
-              "typeface": {0: "normal", 1: "sans", 2: "serif", 3: "monospace"},
-              "ellipsize": {0: "none", 1: "start", 2: "middle", 3: "end", 4: "marquee"},
-              "capitalize": {0: "none", 1: "sentences", 2: "words", 3: "characters"},
-              "imeOptions": {0: "actionUnspecified", 1: "actionNone", 2: "actionGo",
-                             3: "actionSearch", 4: "actionSend", 5: "actionNext",
-                             6: "actionDone", 7: "actionPrevious"},
+              "orientation":{0:"horizontal",1:"vertical"},
+              "visibility":{0:"visible",1:"invisible",2:"gone"},
+              "textAlignment":{0:"inherit",1:"gravity",2:"textStart",3:"textEnd",4:"center",5:"viewStart",6:"viewEnd"},
+              "layoutDirection":{0:"ltr",1:"rtl",2:"locale",3:"inherit"},
+              "typeface":{0:"normal",1:"sans",2:"serif",3:"monospace"},
+              "ellipsize":{0:"none",1:"start",2:"middle",3:"end",4:"marquee"},
+              "capitalize":{0:"none",1:"sentences",2:"words",3:"characters"},
+              "imeOptions":{0:"actionUnspecified",1:"actionNone",2:"actionGo",3:"actionSearch",4:"actionSend",
+                            5:"actionNext",6:"actionDone",7:"actionPrevious"},
           }
 
-
-          def parse_raw_value(raw_value):
-              raw_value = raw_value.strip()
-              if raw_value.lower().startswith("0x") or raw_value.lower().startswith("-0x"):
-                  neg = raw_value.startswith("-")
-                  digits = raw_value[1:] if neg else raw_value
-                  n = int(digits, 16)
-                  return -n if neg else n
-              return int(raw_value, 10)
-
+          def parse_raw_value(v):
+              v = v.strip()
+              if v.lower().startswith("0x") or v.lower().startswith("-0x"):
+                  neg = v.startswith("-"); digits = v[1:] if neg else v
+                  n = int(digits, 16); return -n if neg else n
+              return int(v, 10)
 
           def resolve_symbol(attr_name, category, value):
-              short_name = attr_name.split(":")[-1]
+              sn = attr_name.split(":")[-1]
               if category == "dimension_enum":
-                  if short_name in DIMENSION_ENUM_ATTRS:
-                      return decode_dimension_enum(value)
-                  return None
+                  return decode_dimension_enum(value) if sn in DIMENSION_ENUM_ATTRS else None
               if category == "flags":
-                  decoder = FLAG_DECODERS.get(short_name)
-                  if decoder:
-                      return decoder(value)
-                  return None
+                  d = FLAG_DECODERS.get(sn); return d(value) if d else None
               if category == "enum":
-                  if short_name == "screenOrientation":
-                      return decode_screen_orientation(value)
-                  if short_name == "scaleType":
-                      return decode_scale_type(value)
-                  if short_name == "windowLayoutInDisplayCutoutMode":
-                      return decode_window_layout_in_display_cutout_mode(value)
-                  if short_name == "breakStrategy":
-                      return decode_break_strategy(value)
-                  if short_name == "hyphenationFrequency":
-                      return decode_hyphenation_frequency(value)
-                  table = ENUM_TABLES.get(short_name)
-                  if table:
-                      return table.get(value)
-                  return None
+                  if sn == "screenOrientation": return decode_screen_orientation(value)
+                  if sn == "scaleType": return decode_scale_type(value)
+                  if sn == "windowLayoutInDisplayCutoutMode": return decode_window_layout_in_display_cutout_mode(value)
+                  if sn == "breakStrategy": return decode_break_strategy(value)
+                  if sn == "hyphenationFrequency": return decode_hyphenation_frequency(value)
+                  t = ENUM_TABLES.get(sn); return t.get(value) if t else None
               return None
 
-
-          ITEM_RE = re.compile(
-              r'(<item\s+name="((?:android:)?[\w.]+)"[^>]*>)\s*'
-              r'(-?0[xX][0-9a-fA-F]+|-?[0-9]+)\s*(</item>)'
-          )
-
+          ITEM_RE = re.compile(r'(<item\s+name="((?:android:)?[\w.]+)"[^>]*>)\s*(-?0[xX][0-9a-fA-F]+|-?[0-9]+)\s*(</item>)')
 
           def scan_all():
-              total_fixed = 0
-              total_seen = 0
+              total_fixed = total_seen = 0
               for xml_file in RES_ROOT.rglob("*.xml"):
-                  try:
-                      text = xml_file.read_text(encoding="utf-8")
-                  except Exception:
-                      continue
+                  try: text = xml_file.read_text(encoding="utf-8")
+                  except Exception: continue
                   fixed_here = []
                   def repl(m):
                       nonlocal total_seen
                       open_tag, attr_name, raw_value, close_tag = m.groups()
                       total_seen += 1
-                      try:
-                          value = parse_raw_value(raw_value)
-                      except ValueError:
-                          return m.group(0)
-                      short_name = attr_name.split(":")[-1]
-                      symbol = None
-                      if short_name in DIMENSION_ENUM_ATTRS:
-                          symbol = decode_dimension_enum(value)
-                      elif short_name in FLAG_DECODERS:
-                          symbol = FLAG_DECODERS[short_name](value)
-                      elif short_name == "screenOrientation":
-                          symbol = decode_screen_orientation(value)
-                      elif short_name == "scaleType":
-                          symbol = decode_scale_type(value)
-                      elif short_name == "windowLayoutInDisplayCutoutMode":
-                          symbol = decode_window_layout_in_display_cutout_mode(value)
-                      elif short_name == "breakStrategy":
-                          symbol = decode_break_strategy(value)
-                      elif short_name == "hyphenationFrequency":
-                          symbol = decode_hyphenation_frequency(value)
-                      elif short_name in ENUM_TABLES:
-                          symbol = ENUM_TABLES[short_name].get(value)
-                      if symbol is None:
-                          return m.group(0)
+                      try: value = parse_raw_value(raw_value)
+                      except ValueError: return m.group(0)
+                      sn = attr_name.split(":")[-1]; symbol = None
+                      if sn in DIMENSION_ENUM_ATTRS: symbol = decode_dimension_enum(value)
+                      elif sn in FLAG_DECODERS: symbol = FLAG_DECODERS[sn](value)
+                      elif sn == "screenOrientation": symbol = decode_screen_orientation(value)
+                      elif sn == "scaleType": symbol = decode_scale_type(value)
+                      elif sn == "windowLayoutInDisplayCutoutMode": symbol = decode_window_layout_in_display_cutout_mode(value)
+                      elif sn == "breakStrategy": symbol = decode_break_strategy(value)
+                      elif sn == "hyphenationFrequency": symbol = decode_hyphenation_frequency(value)
+                      elif sn in ENUM_TABLES: symbol = ENUM_TABLES[sn].get(value)
+                      if symbol is None: return m.group(0)
                       fixed_here.append(f"{attr_name}: {raw_value} -> {symbol}")
                       return f"{open_tag}{symbol}{close_tag}"
                   new_text = ITEM_RE.sub(repl, text)
@@ -678,780 +399,682 @@ jobs:
                       xml_file.write_text(new_text, encoding="utf-8")
                       total_fixed += len(fixed_here)
                       print(f"{xml_file.relative_to(RES_ROOT)}:")
-                      for line in fixed_here:
-                          print("  -", line)
-              print(f"Proactive scan: inspected {total_seen} raw-valued items, "
-                    f"symbolized {total_fixed}.")
+                      for l in fixed_here: print("  -", l)
+              print(f"Proactive scan: {total_seen} items inspected, {total_fixed} symbolized.")
 
-
-          # Numeric value rejected: try to symbolize.
           LOG_NUMERIC_RE = re.compile(
               r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
               r'expected\s+(?P<category>flags|enum|dimension enum)\s+'
               r'but got \(raw string\)\s+(?P<value>-?0[xX][0-9a-fA-F]+|-?[0-9]+)'
           )
-
-          # Symbolic value rejected: our own previous replacement was wrong -> drop.
           LOG_SYMBOLIC_RE = re.compile(
               r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
               r'expected\s+(?P<category>flags|enum|dimension enum)\s+'
               r'but got \(raw string\)\s+(?P<value>[A-Za-z_][A-Za-z0-9_|]*)\.?\s*$'
           )
 
-
-          def _find_item_span(lines, idx):
-              """Return (start, end) line indices of the <item> element containing idx."""
+          def _item_span(lines, idx):
               start = None
               for i in range(idx, -1, -1):
-                  if '<item' in lines[i]:
-                      start = i
-                      break
-              if start is None:
-                  return None
+                  if '<item' in lines[i]: start = i; break
+              if start is None: return None
               end = start
               if '</item>' not in lines[start]:
                   for j in range(start + 1, min(start + 20, len(lines))):
                       end = j
-                      if '</item>' in lines[j]:
-                          break
+                      if '</item>' in lines[j]: break
               return (start, end)
-
 
           def fix_from_log(log_path):
               text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
-
-              numeric_matches = []
-              symbolic_matches = []
+              numeric_matches, symbolic_matches = [], []
               for line in text.splitlines():
                   m1 = LOG_NUMERIC_RE.search(line)
-                  if m1:
-                      numeric_matches.append(m1.groupdict())
-                      continue
+                  if m1: numeric_matches.append(m1.groupdict()); continue
                   m2 = LOG_SYMBOLIC_RE.search(line)
-                  if m2:
-                      symbolic_matches.append(m2.groupdict())
-
+                  if m2: symbolic_matches.append(m2.groupdict())
               if not numeric_matches and not symbolic_matches:
                   print("No AAPT2 raw-value errors found in log.")
                   return 0
-
               by_file_numeric = {}
-              for m in numeric_matches:
-                  by_file_numeric.setdefault(m["file"], []).append(m)
-
+              for m in numeric_matches: by_file_numeric.setdefault(m["file"], []).append(m)
               by_file_symbolic = {}
-              for m in symbolic_matches:
-                  by_file_symbolic.setdefault(m["file"], []).append(m)
-
-              total_fixed = 0
-              total_dropped = 0
-
-              # 1) Numeric failures: symbolize via resolver, else drop the item line.
-              for file_path, entries in by_file_numeric.items():
-                  p = Path(file_path)
-                  if not p.is_file():
-                      print(f"::warning::Could not locate {file_path}; skipping.")
-                      continue
+              for m in symbolic_matches: by_file_symbolic.setdefault(m["file"], []).append(m)
+              total_fixed = total_dropped = 0
+              for fp, entries in by_file_numeric.items():
+                  p = Path(fp)
+                  if not p.is_file(): continue
                   lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
                   entries.sort(key=lambda e: int(e["line"]), reverse=True)
-                  for entry in entries:
-                      idx = int(entry["line"]) - 1
-                      if idx < 0 or idx >= len(lines):
-                          continue
-                      line_text = lines[idx]
-                      name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
-                      attr_name = name_match.group(1) if name_match else None
-                      category_key = entry["category"].replace(" ", "_")
-                      try:
-                          value = parse_raw_value(entry["value"])
-                      except ValueError:
-                          value = None
-                      symbol = None
-                      if attr_name and value is not None:
-                          symbol = resolve_symbol(attr_name, category_key, value)
-                      if symbol is not None:
-                          new_line, n = re.subn(re.escape(entry["value"]), symbol, line_text, count=1)
+                  for e in entries:
+                      idx = int(e["line"]) - 1
+                      if idx < 0 or idx >= len(lines): continue
+                      lt = lines[idx]
+                      nm = re.search(r'name="((?:android:)?[\w.]+)"', lt)
+                      an = nm.group(1) if nm else None
+                      ck = e["category"].replace(" ", "_")
+                      try: v = parse_raw_value(e["value"])
+                      except ValueError: v = None
+                      sym = resolve_symbol(an, ck, v) if an and v is not None else None
+                      if sym is not None:
+                          nl, n = re.subn(re.escape(e["value"]), sym, lt, count=1)
                           if n:
-                              lines[idx] = new_line
-                              total_fixed += 1
-                              print(f"FIXED {file_path}:{entry['line']}  "
-                                    f"{attr_name}: {entry['value']} -> {symbol}")
+                              lines[idx] = nl; total_fixed += 1
+                              print(f"FIXED {fp}:{e['line']} {an}: {e['value']} -> {sym}")
                               continue
-                      print(f"::warning::DROPPED numeric {entry['category']} value "
-                            f"at {file_path}:{entry['line']} "
-                            f"({attr_name} = {entry['value']})")
-                      lines[idx] = ""
-                      total_dropped += 1
+                      print(f"::warning::DROPPED numeric {e['category']} at {fp}:{e['line']}")
+                      lines[idx] = ""; total_dropped += 1
                   p.write_text("".join(lines), encoding="utf-8")
-
-              # 2) Symbolic failures: our replacement was wrong; drop the <item>.
-              for file_path, entries in by_file_symbolic.items():
-                  p = Path(file_path)
-                  if not p.is_file():
-                      print(f"::warning::Could not locate {file_path}; skipping.")
-                      continue
+              for fp, entries in by_file_symbolic.items():
+                  p = Path(fp)
+                  if not p.is_file(): continue
                   lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
                   spans = []
-                  for entry in entries:
-                      idx = int(entry["line"]) - 1
-                      span = _find_item_span(lines, idx)
-                      if span:
-                          spans.append((span, entry))
+                  for e in entries:
+                      idx = int(e["line"]) - 1
+                      span = _item_span(lines, idx)
+                      if span: spans.append((span, e))
                   spans.sort(key=lambda s: s[0][0], reverse=True)
-                  for (start, end), entry in spans:
-                      print(f"::warning::DROPPED item with invalid symbolic value "
-                            f"at {file_path}:{entry['line']} "
-                            f"(value '{entry['value']}' rejected by AAPT2)")
-                      for k in range(start, end + 1):
-                          lines[k] = ""
+                  for (start, end), e in spans:
+                      print(f"::warning::DROPPED invalid symbolic item at {fp}:{e['line']} (value '{e['value']}')")
+                      for k in range(start, end + 1): lines[k] = ""
                       total_dropped += 1
                   p.write_text("".join(lines), encoding="utf-8")
-
-              print(f"Targeted log-driven fix: {total_fixed} symbolized, "
-                    f"{total_dropped} dropped.")
+              print(f"Targeted fix: {total_fixed} symbolized, {total_dropped} dropped.")
               return total_fixed + total_dropped
 
-
           def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--scan-all", action="store_true")
-              parser.add_argument("--fix-from-log")
-              args = parser.parse_args()
-              if args.scan_all:
-                  scan_all()
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--scan-all", action="store_true")
+              ap.add_argument("--fix-from-log")
+              args = ap.parse_args()
+              if args.scan_all: scan_all()
               elif args.fix_from_log:
-                  changed = fix_from_log(args.fix_from_log)
-                  if changed == 0:
-                      sys.exit(2)
-              else:
-                  parser.error("Specify --scan-all or --fix-from-log LOGFILE")
+                  if fix_from_log(args.fix_from_log) == 0: sys.exit(2)
+              else: ap.error("Specify --scan-all or --fix-from-log")
 
-
-          if __name__ == "__main__":
-              main()
+          if __name__ == "__main__": main()
           PYEOF
-
-          echo "Shared resolver written to tools/aapt_symbol_fix.py"
+          echo "aapt_symbol_fix.py written."
 
       # ============================================================
-      # 14. WRITE SMALI REGISTER FIX SCRIPT
+      # WRITE SMALI REGISTER FIX SCRIPT
       # ============================================================
       - name: Write smali register fix script
         shell: bash
         run: |
           set -euo pipefail
-
-          cd "$PROJECT_DIR"
-          mkdir -p tools
-
+          cd "$PROJECT_DIR"; mkdir -p tools
           cat > tools/smali_register_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Fix smali register errors from a Gradle/Apktool build log."""
-          import re
-          import sys
+          import re, sys
           from pathlib import Path
 
-          LOG_RE = re.compile(
-              r'(?P<file>\S+\.smali)\[(?P<line>\d+),\d+\]\s+'
-              r'This method requires at least (?P<needed>\d+) registers'
-          )
-
+          LOG_RE = re.compile(r'(?P<file>\S+\.smali)\[(?P<line>\d+),\d+\]\s+This method requires at least (?P<needed>\d+) registers')
           LOCALS_RE = re.compile(r'^\s*\.locals\s+(\d+)')
           REGISTERS_RE = re.compile(r'^\s*\.registers\s+(\d+)')
-
 
           def fix_from_log(log_path):
               text = Path(log_path).read_text(encoding='utf-8', errors='ignore')
               matches = []
               for line in text.splitlines():
                   m = LOG_RE.search(line)
-                  if m:
-                      matches.append(m.groupdict())
+                  if m: matches.append(m.groupdict())
               if not matches:
                   print("No smali register errors found in log.")
                   return 0
               by_file = {}
-              for m in matches:
-                  by_file.setdefault(m['file'], []).append(m)
+              for m in matches: by_file.setdefault(m['file'], []).append(m)
               total_fixed = 0
-              for file_path, entries in by_file.items():
-                  p = Path(file_path)
+              for fp, entries in by_file.items():
+                  p = Path(fp)
                   if not p.is_file():
-                      print(f"::warning::Could not find {file_path}")
-                      continue
+                      print(f"::warning::Not found {fp}"); continue
                   lines = p.read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
                   modified = False
-                  for entry in entries:
-                      line_idx = int(entry['line']) - 1
-                      needed = int(entry['needed'])
-                      found = False
-                      for i in range(line_idx, -1, -1):
-                          locals_m = LOCALS_RE.match(lines[i])
-                          registers_m = REGISTERS_RE.match(lines[i])
-                          if locals_m:
-                              current = int(locals_m.group(1))
-                              if current < needed:
-                                  new_val = needed + 1
-                                  lines[i] = f'.locals {new_val}\n'
-                                  total_fixed += 1
-                                  modified = True
-                                  print(f"FIXED {file_path}: .locals {current} -> {new_val}")
-                              found = True
-                              break
-                          if registers_m:
-                              current = int(registers_m.group(1))
-                              if current < needed:
-                                  new_val = needed + 1
-                                  lines[i] = f'.registers {new_val}\n'
-                                  total_fixed += 1
-                                  modified = True
-                                  print(f"FIXED {file_path}: .registers {current} -> {new_val}")
-                              found = True
-                              break
+                  for e in entries:
+                      li = int(e['line']) - 1; needed = int(e['needed']); found = False
+                      for i in range(li, -1, -1):
+                          lm = LOCALS_RE.match(lines[i]); rm = REGISTERS_RE.match(lines[i])
+                          if lm:
+                              cur = int(lm.group(1))
+                              if cur < needed:
+                                  nv = needed + 1; lines[i] = f'.locals {nv}\n'; total_fixed += 1; modified = True
+                                  print(f"FIXED {fp}: .locals {cur} -> {nv}")
+                              found = True; break
+                          if rm:
+                              cur = int(rm.group(1))
+                              if cur < needed:
+                                  nv = needed + 1; lines[i] = f'.registers {nv}\n'; total_fixed += 1; modified = True
+                                  print(f"FIXED {fp}: .registers {cur} -> {nv}")
+                              found = True; break
                       if not found:
-                          print(f"::warning::No .locals/.registers found before line {entry['line']} in {file_path}")
-                  if modified:
-                      p.write_text(''.join(lines), encoding='utf-8')
+                          print(f"::warning::No .locals/.registers before line {e['line']} in {fp}")
+                  if modified: p.write_text(''.join(lines), encoding='utf-8')
               return total_fixed
-
 
           def main():
               if len(sys.argv) < 2:
-                  print("Usage: smali_register_fix.py <build-log>")
-                  sys.exit(2)
-              changed = fix_from_log(sys.argv[1])
-              if changed == 0:
-                  sys.exit(2)
+                  print("Usage: smali_register_fix.py <log>"); sys.exit(2)
+              if fix_from_log(sys.argv[1]) == 0: sys.exit(2)
               return 0
 
-
-          if __name__ == "__main__":
-              sys.exit(main())
+          if __name__ == "__main__": sys.exit(main())
           PYEOF
-
-          chmod +x tools/smali_register_fix.py
-          echo "Smali register fix written to tools/smali_register_fix.py"
+          echo "smali_register_fix.py written."
 
       # ============================================================
-      # 15. WRITE ALPHA ATTR FIX SCRIPT
+      # WRITE ALPHA ATTR FIX SCRIPT (with corrected exit codes)
       # ============================================================
       - name: Write alpha attr fix script
         shell: bash
         run: |
           set -euo pipefail
-
-          cd "$PROJECT_DIR"
-          mkdir -p tools
-
+          cd "$PROJECT_DIR"; mkdir -p tools
           cat > tools/attrs_alpha_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Ensure <attr name="alpha" format="float"/> exists in app/res/values/attrs.xml."""
+          """Ensure <attr name="alpha" format="float"/> exists.
+          Exit 0 = added (did something). Exit 2 = already present (nothing to do)."""
           import sys
           from pathlib import Path
 
           ATTRS_PATH = Path("app/res/values/attrs.xml")
-
 
           def main():
               if ATTRS_PATH.exists():
                   text = ATTRS_PATH.read_text(encoding='utf-8')
                   if 'name="alpha"' in text:
                       print("alpha attr already present.")
-                      return 0
+                      return 2
                   if '</resources>' in text:
-                      text = text.replace(
-                          '</resources>',
-                          '    <attr name="alpha" format="float"/>\n</resources>'
-                      )
+                      text = text.replace('</resources>', '    <attr name="alpha" format="float"/>\n</resources>')
                   else:
                       text += '\n<attr name="alpha" format="float"/>\n'
                   ATTRS_PATH.write_text(text, encoding='utf-8')
                   print("Added alpha attr to existing attrs.xml")
-                  return 1
-              else:
-                  ATTRS_PATH.parent.mkdir(parents=True, exist_ok=True)
-                  ATTRS_PATH.write_text(
-                      '<?xml version="1.0" encoding="utf-8"?>\n'
-                      '<resources>\n'
-                      '    <attr name="alpha" format="float"/>\n'
-                      '</resources>\n',
-                      encoding='utf-8'
-                  )
-                  print("Created attrs.xml with alpha attr")
-                  return 1
-
+                  return 0
+              ATTRS_PATH.parent.mkdir(parents=True, exist_ok=True)
+              ATTRS_PATH.write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <attr name="alpha" format="float"/>\n</resources>\n',
+                  encoding='utf-8')
+              print("Created attrs.xml with alpha attr")
+              return 0
 
           if __name__ == "__main__":
-              sys.exit(0 if main() == 0 else 0)
+              sys.exit(main())
           PYEOF
-
-          chmod +x tools/attrs_alpha_fix.py
-          echo "Alpha attr fix written to tools/attrs_alpha_fix.py"
+          echo "attrs_alpha_fix.py written."
 
       # ============================================================
-      # 16. PROACTIVE RAW-VALUE REPAIR PASS
+      # WRITE MISSING RESOURCE FIX SCRIPT (NEW)
+      #
+      # Creates placeholder .xml files (or values/ entries) for any
+      # resource referenced from XML but missing from the source tree.
+      # Example: anim/r.xml references @interpolator/b -> create
+      # app/res/interpolator/b.xml with a valid <linearInterpolator/>.
       # ============================================================
+      - name: Write missing resource fix script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"; mkdir -p tools
+          cat > tools/missing_resources_fix.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Create placeholder resources for references reported as missing by AAPT2."""
+          import re, sys
+          from pathlib import Path
+
+          LOG_RE = re.compile(r'error:\s+resource\s+(?P<rtype>[\w.-]+)/(?P<rname>[\w.-]+)\s+not found')
+          RES_ROOT = Path("app/res")
+
+          FILE_PLACEHOLDERS = {
+              "interpolator": '<?xml version="1.0" encoding="utf-8"?>\n<linearInterpolator/>\n',
+              "anim":         '<?xml version="1.0" encoding="utf-8"?>\n<set/>\n',
+              "animator":     '<?xml version="1.0" encoding="utf-8"?>\n<set/>\n',
+              "drawable":     ('<?xml version="1.0" encoding="utf-8"?>\n'
+                               '<shape xmlns:android="http://schemas.android.com/apk/res/android">'
+                               '<solid android:color="#00000000"/></shape>\n'),
+              "mipmap":       ('<?xml version="1.0" encoding="utf-8"?>\n'
+                               '<shape xmlns:android="http://schemas.android.com/apk/res/android">'
+                               '<solid android:color="#00000000"/></shape>\n'),
+              "color":        '<?xml version="1.0" encoding="utf-8"?>\n<selector xmlns:android="http://schemas.android.com/apk/res/android"/>\n',
+              "layout":       '<?xml version="1.0" encoding="utf-8"?>\n<View xmlns:android="http://schemas.android.com/apk/res/android"/>\n',
+              "xml":          '<?xml version="1.0" encoding="utf-8"?>\n<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"/>\n',
+              "menu":         '<?xml version="1.0" encoding="utf-8"?>\n<menu xmlns:android="http://schemas.android.com/apk/res/android"/>\n',
+              "font":         None,  # font resources need a real TTF/OTF, skip
+              "raw":          None,  # raw resources are files, skip
+          }
+
+          VALUES_TYPES = {"string","color","dimen","array","integer","bool","style","plurals","fraction","id"}
+
+          def _entry_xml(rtype, rname):
+              if rtype == "attr":
+                  return f'    <attr name="{rname}" format="string"/>\n'
+              if rtype == "id":
+                  return f'    <item type="id" name="{rname}"/>\n'
+              if rtype == "string":
+                  return f'    <string name="{rname}">placeholder</string>\n'
+              if rtype == "color":
+                  return f'    <color name="{rname}">#00000000</color>\n'
+              if rtype == "dimen":
+                  return f'    <dimen name="{rname}">0dp</dimen>\n'
+              if rtype == "bool":
+                  return f'    <bool name="{rname}">false</bool>\n'
+              if rtype == "integer":
+                  return f'    <integer name="{rname}">0</integer>\n'
+              return f'    <item type="{rtype}" name="{rname}"/>\n'
+
+          def create_placeholder(rtype, rname):
+              if rtype in VALUES_TYPES or rtype == "attr":
+                  overrides = RES_ROOT / "values" / "zz_placeholders.xml"
+                  overrides.parent.mkdir(parents=True, exist_ok=True)
+                  if not overrides.exists():
+                      overrides.write_text('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n</resources>\n', encoding='utf-8')
+                  text = overrides.read_text(encoding='utf-8')
+                  marker = f'name="{rname}"'
+                  if marker in text:
+                      return False
+                  text = text.replace("</resources>", _entry_xml(rtype, rname) + "</resources>")
+                  overrides.write_text(text, encoding='utf-8')
+                  return True
+              if rtype not in FILE_PLACEHOLDERS or FILE_PLACEHOLDERS[rtype] is None:
+                  return False
+              target_dir = RES_ROOT / rtype
+              target_dir.mkdir(parents=True, exist_ok=True)
+              target = target_dir / f"{rname}.xml"
+              if target.exists():
+                  return False
+              target.write_text(FILE_PLACEHOLDERS[rtype], encoding='utf-8')
+              return True
+
+          def fix_from_log(log_path):
+              text = Path(log_path).read_text(encoding='utf-8', errors='ignore')
+              matches = []
+              for line in text.splitlines():
+                  m = LOG_RE.search(line)
+                  if m: matches.append(m.groupdict())
+              if not matches:
+                  print("No missing-resource errors found in log.")
+                  return 0
+              created = 0; seen = set()
+              for m in matches:
+                  key = (m["rtype"], m["rname"])
+                  if key in seen: continue
+                  seen.add(key)
+                  if create_placeholder(m["rtype"], m["rname"]):
+                      print(f"CREATED placeholder: {m['rtype']}/{m['rname']}")
+                      created += 1
+                  else:
+                      print(f"::warning::Could not create placeholder for {m['rtype']}/{m['rname']}")
+              return created
+
+          def main():
+              if len(sys.argv) < 2:
+                  print("Usage: missing_resources_fix.py <log>"); sys.exit(2)
+              if fix_from_log(sys.argv[1]) == 0: sys.exit(2)
+              return 0
+
+          if __name__ == "__main__": sys.exit(main())
+          PYEOF
+          echo "missing_resources_fix.py written."
+
+      # ============================================================
+      # WRITE SMALI SYNTAX FIX SCRIPT (NEW)
+      #
+      # Repairs smali parser errors of the form:
+      #   file.smali[L,C] required (...)+ loop did not match anything at input '...'
+      # For a .field declaration with a malformed/empty value, replaces the
+      # value with 0x0. Otherwise comments the offending line out.
+      # ============================================================
+      - name: Write smali syntax fix script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"; mkdir -p tools
+          cat > tools/smali_syntax_fix.py <<'PYEOF'
+          #!/usr/bin/env python3
+          import re, sys
+          from pathlib import Path
+
+          SYNTAX_RE = re.compile(
+              r'(?P<file>\S+\.smali)\[(?P<line>\d+),(?P<col>\d+)\]\s+'
+              r'required \(\.\.\.\)\+ loop did not match anything at input'
+          )
+
+          FIELD_RE = re.compile(r'^(\s*\.field\s+[^\n=]+?=\s*)(.*?)(\s*(?:#.*)?)$')
+
+          def repair_line(line):
+              stripped = line.rstrip("\n")
+              m = FIELD_RE.match(stripped)
+              if m:
+                  prefix, value, suffix = m.groups()
+                  value_clean = value.strip()
+                  if not value_clean or re.fullmatch(r'-?0[xX]?', value_clean):
+                      return prefix + "0x0" + suffix + "\n", True
+                  tokens = value_clean.split()
+                  if len(tokens) > 1:
+                      return prefix + tokens[0] + suffix + "\n", True
+                  return line, False
+              return "# [smali_syntax_fix removed malformed line]\n", True
+
+          def fix_from_log(log_path):
+              text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
+              matches = []
+              for line in text.splitlines():
+                  m = SYNTAX_RE.search(line)
+                  if m: matches.append(m.groupdict())
+              if not matches:
+                  print("No smali syntax errors found in log.")
+                  return 0
+              by_file = {}
+              for m in matches: by_file.setdefault(m["file"], []).append(m)
+              total_fixed = 0
+              for fp, entries in by_file.items():
+                  p = Path(fp)
+                  if not p.is_file():
+                      print(f"::warning::Not found {fp}"); continue
+                  lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                  entries.sort(key=lambda e: int(e["line"]), reverse=True)
+                  for e in entries:
+                      idx = int(e["line"]) - 1
+                      if idx < 0 or idx >= len(lines): continue
+                      nl, fixed = repair_line(lines[idx])
+                      if fixed:
+                          lines[idx] = nl; total_fixed += 1
+                          print(f"FIXED {fp}:{e['line']}")
+                      else:
+                          print(f"::warning::Could not auto-repair {fp}:{e['line']}")
+                  p.write_text("".join(lines), encoding="utf-8")
+              return total_fixed
+
+          def main():
+              if len(sys.argv) < 2:
+                  print("Usage: smali_syntax_fix.py <log>"); sys.exit(2)
+              if fix_from_log(sys.argv[1]) == 0: sys.exit(2)
+              return 0
+
+          if __name__ == "__main__": sys.exit(main())
+          PYEOF
+          echo "smali_syntax_fix.py written."
+
       - name: Repair raw AAPT2 symbolic attribute values
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           python3 tools/aapt_symbol_fix.py --scan-all
 
-      # ============================================================
-      # 17. REPAIR MALFORMED 9-PATCH RESOURCES
-      # ============================================================
       - name: Repair malformed 9-patch resources
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           python3 <<'PY'
           from pathlib import Path
-          import struct
-          import zlib
-
+          import struct, zlib
           root = Path("app/res")
-
           def read_png_rgba(path):
               data = path.read_bytes()
-              if data[:8] != b'\x89PNG\r\n\x1a\n':
-                  raise ValueError("not a PNG")
-              pos = 8
-              width = height = None
-              color_type = None
-              bit_depth = None
-              idat = bytearray()
+              if data[:8] != b'\x89PNG\r\n\x1a\n': raise ValueError("not a PNG")
+              pos = 8; width = height = None; color_type = None; bit_depth = None; idat = bytearray()
               while pos < len(data):
                   length = struct.unpack(">I", data[pos:pos+4])[0]
-                  ctype = data[pos+4:pos+8]
-                  chunk = data[pos+8:pos+8+length]
-                  pos += 12 + length
+                  ctype = data[pos+4:pos+8]; chunk = data[pos+8:pos+8+length]; pos += 12 + length
                   if ctype == b'IHDR':
-                      width, height, bit_depth, color_type, _, _, _ = struct.unpack(
-                          ">IIBBBBB", chunk
-                      )
-                  elif ctype == b'IDAT':
-                      idat.extend(chunk)
-                  elif ctype == b'IEND':
-                      break
-              if width is None:
-                  raise ValueError("missing IHDR")
-              if bit_depth != 8:
-                  raise ValueError("unsupported bit depth")
+                      width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", chunk)
+                  elif ctype == b'IDAT': idat.extend(chunk)
+                  elif ctype == b'IEND': break
+              if width is None or bit_depth != 8: raise ValueError("bad IHDR")
               raw = zlib.decompress(bytes(idat))
-              if color_type == 6:
-                  channels = 4
-              elif color_type == 2:
-                  channels = 3
-              else:
-                  raise ValueError("unsupported PNG color type")
-              stride = width * channels
-              rows = []
-              offset = 0
-              previous = bytearray(stride)
+              channels = 4 if color_type == 6 else (3 if color_type == 2 else 0)
+              if channels == 0: raise ValueError("bad color type")
+              stride = width * channels; rows = []; offset = 0; previous = bytearray(stride)
               for _ in range(height):
-                  filter_type = raw[offset]
-                  offset += 1
-                  current = bytearray(raw[offset:offset+stride])
-                  offset += stride
+                  ft = raw[offset]; offset += 1
+                  current = bytearray(raw[offset:offset+stride]); offset += stride
                   for i in range(stride):
                       left = current[i-channels] if i >= channels else 0
-                      up = previous[i]
-                      up_left = previous[i-channels] if i >= channels else 0
-                      if filter_type == 0:
-                          pass
-                      elif filter_type == 1:
-                          current[i] = (current[i] + left) & 255
-                      elif filter_type == 2:
-                          current[i] = (current[i] + up) & 255
-                      elif filter_type == 3:
-                          current[i] = (current[i] + ((left + up) // 2)) & 255
-                      elif filter_type == 4:
-                          p = left + up - up_left
-                          pa, pb, pc = abs(p-left), abs(p-up), abs(p-up_left)
-                          if pa <= pb and pa <= pc:
-                              predictor = left
-                          elif pb <= pc:
-                              predictor = up
-                          else:
-                              predictor = up_left
-                          current[i] = (current[i] + predictor) & 255
-                      else:
-                          raise ValueError(f"unsupported PNG filter {filter_type}")
-                  previous = current
-                  rows.append(current)
+                      up = previous[i]; ul = previous[i-channels] if i >= channels else 0
+                      if ft == 0: pass
+                      elif ft == 1: current[i] = (current[i] + left) & 255
+                      elif ft == 2: current[i] = (current[i] + up) & 255
+                      elif ft == 3: current[i] = (current[i] + ((left + up) // 2)) & 255
+                      elif ft == 4:
+                          p = left + up - ul; pa, pb, pc = abs(p-left), abs(p-up), abs(p-ul)
+                          pr = left if pa <= pb and pa <= pc else (up if pb <= pc else ul)
+                          current[i] = (current[i] + pr) & 255
+                      else: raise ValueError(f"bad filter {ft}")
+                  previous = current; rows.append(current)
               pixels = []
               for row in rows:
-                  row_pixels = []
+                  rp = []
                   for x in range(width):
-                      base = x * channels
-                      if channels == 4:
-                          r, g, b, a = row[base:base+4]
-                      else:
-                          r, g, b = row[base:base+3]
-                          a = 255
-                      row_pixels.append((r, g, b, a))
-                  pixels.append(row_pixels)
+                      b = x * channels
+                      if channels == 4: r, g, bl, a = row[b:b+4]
+                      else: r, g, bl = row[b:b+3]; a = 255
+                      rp.append((r, g, bl, a))
+                  pixels.append(rp)
               return width, height, pixels
-
           def is_neutral(px):
               r, g, b, a = px
-              if a == 0:
-                  return True
-              return a == 255 and r == 255 and g == 255 and b == 255
-
+              return a == 0 or (a == 255 and r == 255 and g == 255 and b == 255)
           def is_black_marker(px):
               r, g, b, a = px
               return a == 255 and r == 0 and g == 0 and b == 0
-
           def validate_ninepatch(path):
-              try:
-                  width, height, pixels = read_png_rgba(path)
-              except Exception as e:
-                  return False, f"could not validate: {e}"
-              if width < 3 or height < 3:
-                  return False, "too small to be a valid 9-patch"
-              top_row = pixels[0]
-              bottom_row = pixels[height-1]
-              left_col = [pixels[y][0] for y in range(height)]
-              right_col = [pixels[y][width-1] for y in range(height)]
-              for corner in (top_row[0], top_row[-1], bottom_row[0], bottom_row[-1]):
-                  if not is_neutral(corner):
-                      return False, "invalid corner pixel (must be transparent)"
-              for px in top_row[1:-1] + bottom_row[1:-1] + left_col[1:-1] + right_col[1:-1]:
-                  if not (is_neutral(px) or is_black_marker(px)):
-                      return False, "invalid 9-patch frame color"
+              try: width, height, pixels = read_png_rgba(path)
+              except Exception as e: return False, str(e)
+              if width < 3 or height < 3: return False, "too small"
+              top = pixels[0]; bot = pixels[height-1]
+              lc = [pixels[y][0] for y in range(height)]; rc = [pixels[y][width-1] for y in range(height)]
+              for c in (top[0], top[-1], bot[0], bot[-1]):
+                  if not is_neutral(c): return False, "bad corner"
+              for px in top[1:-1] + bot[1:-1] + lc[1:-1] + rc[1:-1]:
+                  if not (is_neutral(px) or is_black_marker(px)): return False, "bad frame"
               return True, None
-
           fixed = []
-          for ninepatch in root.rglob("*.9.png"):
-              valid, reason = validate_ninepatch(ninepatch)
-              if valid:
-                  continue
-              new_path = ninepatch.with_name(ninepatch.name[:-6] + ".png")
-              ninepatch.rename(new_path)
-              fixed.append(f"{ninepatch.name} -> {new_path.name} ({reason})")
-          for entry in fixed:
-              print(f"REPAIRED: {entry}")
-          remaining = list(root.rglob("*.9.png"))
-          print(f"Remaining valid .9.png resources: {len(remaining)}")
-          print(f"Malformed resources converted to ordinary PNG: {len(fixed)}")
+          for n in root.rglob("*.9.png"):
+              ok, reason = validate_ninepatch(n)
+              if ok: continue
+              n.rename(n.with_name(n.name[:-6] + ".png"))
+              fixed.append(f"{n.name} ({reason})")
+          for e in fixed: print(f"REPAIRED: {e}")
+          print(f"Remaining .9.png: {len(list(root.rglob('*.9.png')))}")
           PY
 
-      # ============================================================
-      # 18. VERIFY SOURCE STRUCTURE
-      # ============================================================
       - name: Verify source structure
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           ./tools/verify-source.sh
 
-      # ============================================================
-      # 19. REPAIR MERGED SMALI SOURCES
-      # ============================================================
       - name: Repair merged smali sources
         shell: bash
         run: |
           set -euo pipefail
-
-          cd "$PROJECT_DIR"
-          mkdir -p tools
-
+          cd "$PROJECT_DIR"; mkdir -p tools
           cat > tools/smali_split_fix.py <<'PY'
           #!/usr/bin/env python3
-          """Split .smali files that contain multiple '.class' directives."""
-          import pathlib
-          import re
-          import sys
-
+          import pathlib, re, sys
           CLASS_RE = re.compile(r"^\.class\s")
-
-          def split_file(path: pathlib.Path) -> int:
+          def split_file(path):
               lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
               starts = [i for i, ln in enumerate(lines) if CLASS_RE.match(ln)]
-              if len(starts) <= 1:
-                  return 0
-              header = lines[: starts[0]]
-              created, seen = 0, set()
+              if len(starts) <= 1: return 0
+              header = lines[:starts[0]]; created, seen = 0, set()
               for n, s in enumerate(starts):
                   end = starts[n + 1] if n + 1 < len(starts) else len(lines)
                   block = lines[s:end]
-                  if n == 0 and header:
-                      block = header + block
+                  if n == 0 and header: block = header + block
                   descriptor = lines[s].split()[-1].rstrip(";")
-                  if not descriptor.startswith("L"):
-                      print(f"!! unparseable .class line in {path}:{s+1}", file=sys.stderr)
-                      continue
+                  if not descriptor.startswith("L"): continue
                   rel = descriptor[1:] + ".smali"
-                  if rel in seen:
-                      print(f"!! duplicate class {descriptor} in {path} - keeping first", file=sys.stderr)
-                      continue
+                  if rel in seen: continue
                   seen.add(rel)
                   out = path.parent / rel
                   out.parent.mkdir(parents=True, exist_ok=True)
                   out.write_text("".join(block), encoding="utf-8")
                   created += 1
               path.unlink()
-              print(f"split: {path} -> {created} class file(s)")
+              print(f"split: {path} -> {created}")
               return created
-
-          def main() -> int:
+          def main():
               roots = [pathlib.Path(p) for p in sys.argv[1:]] or [pathlib.Path("app")]
               total = 0
-              for root in roots:
-                  for smali in sorted(root.rglob("*.smali")):
-                      try:
-                          total += split_file(smali)
-                      except Exception as exc:
-                          print(f"!! {smali}: {exc}", file=sys.stderr)
+              for r in roots:
+                  for s in sorted(r.rglob("*.smali")):
+                      try: total += split_file(s)
+                      except Exception as e: print(f"!! {s}: {e}", file=sys.stderr)
               print(f"total classes extracted: {total}")
-              return 1 if total else 0
-
-          if __name__ == "__main__":
-              sys.exit(main())
+              return 0 if total else 2
+          if __name__ == "__main__": sys.exit(main())
           PY
           chmod +x tools/smali_split_fix.py
+          echo "Scanning smali sources..."
+          set +e; python3 tools/smali_split_fix.py app; split_status=$?; set -e
+          if [ "$split_status" -eq 0 ]; then echo "Merged files split."; else echo "No merged files."; fi
 
-          echo "Scanning smali sources for duplicate '.class' directives..."
-          set +e
-          python3 tools/smali_split_fix.py app
-          split_status=$?
-          set -e
-          if [ "$split_status" -ne 0 ]; then
-            echo "Merged smali files were split (see above)."
-          else
-            echo "No merged smali files found."
-          fi
-
-          echo "Validating that every remaining .smali holds exactly one class..."
+          echo "Validating every .smali holds exactly one class..."
           python3 <<'PY'
-          import pathlib
-          import re
-          import sys
-
+          import pathlib, re, sys
           bad = []
           for p in pathlib.Path("app").rglob("*.smali"):
               try:
                   with open(p, encoding="utf-8", errors="replace") as fh:
                       n = sum(1 for ln in fh if re.match(r"^\.class\s", ln))
-              except Exception:
-                  continue
-              if n > 1:
-                  bad.append(str(p))
-
+              except Exception: continue
+              if n > 1: bad.append(str(p))
           if bad:
-              print("::error::Still-merged smali files:")
-              for b in bad:
-                  print(f"  - {b}")
+              print("::error::Still-merged:")
+              for b in bad: print(f"  - {b}")
               sys.exit(1)
-          print("All smali files contain exactly one class.")
+          print("OK: exactly one class per file.")
           PY
-
           echo "Smali class count (post-split):"
           find app -path '*/smali*' -type f -name '*.smali' | wc -l
 
-      # ============================================================
-      # 20. SHOW GRADLE VERSION
-      # ============================================================
       - name: Show Gradle version
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
           chmod +x gradlew
           ./gradlew --version --no-daemon
 
       # ============================================================
-      # 21. BUILD UNSIGNED APK (SELF-HEALING)
+      # BUILD UNSIGNED APK (SELF-HEALING)
+      #
+      # Runs 6 repair scripts after each failed attempt. All scripts
+      # use the same convention: exit 0 = did something, exit 2 = nothing.
+      # The loop only aborts when ALL SIX report "nothing to do".
       # ============================================================
       - name: Build unsigned APK
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
-
-          rm -rf build/dist
-          mkdir -p build/dist
-
+          rm -rf build/dist; mkdir -p build/dist
           MAX_ATTEMPTS="${MAX_BUILD_ATTEMPTS:-8}"
-          attempt=1
-          build_ok=0
+          attempt=1; build_ok=0
 
           while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
             echo "=================================================="
             echo "Build attempt $attempt of $MAX_ATTEMPTS"
             echo "=================================================="
-
             LOG_FILE="build_attempt_${attempt}.log"
-
             set +e
             ./gradlew assembleOpenFork --no-daemon --stacktrace 2>&1 | tee "$LOG_FILE"
             status="${PIPESTATUS[0]}"
             set -e
-
             if [ "$status" -eq 0 ]; then
               echo "Build succeeded on attempt $attempt."
-              build_ok=1
-              break
+              build_ok=1; break
             fi
-
             echo "Build attempt $attempt failed (exit $status)."
-
             if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-              echo "::error::Build failed after $MAX_ATTEMPTS attempts. Full log of final attempt:"
-              cat "$LOG_FILE"
-              exit 1
+              echo "::error::Build failed after $MAX_ATTEMPTS attempts."
+              cat "$LOG_FILE"; exit 1
             fi
-
             echo "Attempting automatic repair..."
 
-            set +e
-            python3 tools/aapt_symbol_fix.py --fix-from-log "$LOG_FILE"
-            fix_status=$?
-            set -e
+            set +e; python3 tools/aapt_symbol_fix.py --fix-from-log "$LOG_FILE"; fix_status=$?; set -e
+            set +e; python3 tools/smali_split_fix.py app;                         smali_status=$?; set -e
+            set +e; python3 tools/smali_register_fix.py "$LOG_FILE";              reg_status=$?; set -e
+            set +e; python3 tools/attrs_alpha_fix.py;                             alpha_status=$?; set -e
+            set +e; python3 tools/missing_resources_fix.py "$LOG_FILE";           res_status=$?; set -e
+            set +e; python3 tools/smali_syntax_fix.py "$LOG_FILE";                syn_status=$?; set -e
 
-            set +e
-            python3 tools/smali_split_fix.py app
-            smali_status=$?
-            set -e
-
-            set +e
-            python3 tools/smali_register_fix.py "$LOG_FILE"
-            reg_status=$?
-            set -e
-
-            set +e
-            python3 tools/attrs_alpha_fix.py
-            alpha_status=$?
-            set -e
-
-            if [ "$fix_status" -eq 2 ] && [ "$smali_status" -eq 0 ] && \
-               [ "$reg_status" -eq 2 ] && [ "$alpha_status" -eq 0 ]; then
-              echo "::error::Build failed and no known repair pattern changed anything."
-              echo "  - aapt_symbol_fix.py: no AAPT2 raw-value pattern (exit 2)"
-              echo "  - smali_split_fix.py: no merged smali files (exit 0)"
-              echo "  - smali_register_fix.py: no register errors (exit 2)"
-              echo "  - attrs_alpha_fix.py: alpha attr already present (exit 0)"
+            # Abort only if EVERY script reported "nothing to do" (exit 2).
+            if [ "$fix_status"   -eq 2 ] && \
+               [ "$smali_status" -eq 2 ] && \
+               [ "$reg_status"   -eq 2 ] && \
+               [ "$alpha_status" -eq 2 ] && \
+               [ "$res_status"   -eq 2 ] && \
+               [ "$syn_status"   -eq 2 ]; then
+              echo "::error::Build failed and no known repair pattern matched."
+              echo "  - aapt_symbol_fix:      exit 2 (no raw-value errors)"
+              echo "  - smali_split_fix:      exit 2 (no merged files)"
+              echo "  - smali_register_fix:   exit 2 (no register errors)"
+              echo "  - attrs_alpha_fix:      exit 2 (alpha already present)"
+              echo "  - missing_resources_fix:exit 2 (no missing resources)"
+              echo "  - smali_syntax_fix:     exit 2 (no syntax errors)"
               echo "Full log of failed attempt:"
               cat "$LOG_FILE"
               exit 1
             fi
-
             attempt=$((attempt+1))
           done
 
           if [ "$build_ok" -ne 1 ]; then
-            echo "::error::Build did not succeed."
-            exit 1
+            echo "::error::Build did not succeed."; exit 1
           fi
-
           APK="$PROJECT_DIR/build/dist/MetaEvo-OpenFork-unsigned.apk"
-
           if [ ! -s "$APK" ]; then
             echo "::error::Expected unsigned APK was not produced."
-            echo "Searching for APK files..."
             find "$PROJECT_DIR/build" -type f -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
-
-          echo "Unsigned APK successfully created:"
-          ls -lh "$APK"
-
+          echo "Unsigned APK created:"; ls -lh "$APK"
           cp "$APK" "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk"
 
-      # ============================================================
-      # 22. ZIPALIGN
-      # ============================================================
       - name: Zipalign APK
         shell: bash
         run: |
           set -euo pipefail
-
           ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
-
           "$ZIPALIGN" -v -p 4 \
             "$GITHUB_WORKSPACE/MetaEvo-OpenFork-unsigned.apk" \
             "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
-
           test -s "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
-
-          echo "Zipalign complete:"
           ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
-      # ============================================================
-      # 23. SIGN APK
-      # ============================================================
       - name: Sign APK (ephemeral debug keystore)
         shell: bash
         run: |
           set -euo pipefail
-
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
           KEYTOOL="$JAVA_HOME/bin/keytool"
-
           KEYSTORE="$RUNNER_TEMP/openfork-debug.keystore"
-          STOREPASS="android"
-          KEYALIAS="openfork-debug"
-          KEYPASS="android"
-
-          "$KEYTOOL" -genkeypair \
-            -v \
-            -keystore "$KEYSTORE" \
-            -storepass "$STOREPASS" \
-            -alias "$KEYALIAS" \
-            -keypass "$KEYPASS" \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=MetaEvo OpenFork Debug, OU=CI, O=CI, L=CI, S=CI, C=US"
-
-          "$APKSIGNER" sign \
-            --ks "$KEYSTORE" \
-            --ks-pass "pass:$STOREPASS" \
-            --ks-key-alias "$KEYALIAS" \
-            --key-pass "pass:$KEYPASS" \
+          "$KEYTOOL" -genkeypair -v -keystore "$KEYSTORE" -storepass android \
+            -alias openfork-debug -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=MetaEvo OpenFork Debug, OU=CI, O=CI, L=CI, S=CI, C=US"
+          "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass pass:android \
+            --ks-key-alias openfork-debug --key-pass pass:android \
             --out "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk" \
             "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
-
-          "$APKSIGNER" verify --print-certs \
-            "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
-
-          echo "Signed APK:"
+          "$APKSIGNER" verify --print-certs "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
           ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-signed.apk"
 
-      # ============================================================
-      # 24. CHECKSUMS
-      # ============================================================
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$GITHUB_WORKSPACE"
-
-          sha256sum \
-            MetaEvo-OpenFork-unsigned.apk \
-            MetaEvo-OpenFork-aligned.apk \
-            MetaEvo-OpenFork-signed.apk \
+          sha256sum MetaEvo-OpenFork-unsigned.apk MetaEvo-OpenFork-aligned.apk MetaEvo-OpenFork-signed.apk \
             > MetaEvo-OpenFork-checksums.sha256
-
           cat MetaEvo-OpenFork-checksums.sha256
 
-      # ============================================================
-      # 25. UPLOAD ARTIFACTS
-      # ============================================================
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -1464,9 +1087,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ============================================================
-      # 26. UPLOAD BUILD LOGS ON FAILURE
-      # ============================================================
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
