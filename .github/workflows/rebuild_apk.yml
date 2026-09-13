@@ -37,12 +37,6 @@ jobs:
 
       # ============================================================
       # 2. CHECK ZIP PARTS (resilient SHA-256)
-      #
-      # A mismatch usually means parts were re-uploaded without
-      # updating the recorded hashes here. Unless strict_hash_check
-      # is enabled we warn, print the exact value to paste back, and
-      # continue. Structural integrity is enforced by "unzip -t"
-      # in step 4.
       # ============================================================
       - name: Check ZIP parts
         shell: bash
@@ -228,7 +222,7 @@ jobs:
 
           echo "Project files verified."
 
-          echo "Smali class count:"
+          echo "Smali class count (pre-split):"
           find app \
             -path '*/smali*' \
             -type f \
@@ -236,117 +230,7 @@ jobs:
             wc -l
 
       # ============================================================
-      # 10. REPAIR MERGED SMALI SOURCES
-      #
-      # Some decompiled .smali files contain TWO OR MORE concatenated
-      # classes (several '.class' directives). Smali then aborts with
-      # "missing EOF at '.class'" and the whole build fails. This
-      # step splits every multi-class file into one file per class,
-      # placed on the descriptor path relative to the same smali
-      # root, then re-validates that no merged file remains.
-      # ============================================================
-      - name: Repair merged smali sources
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-          mkdir -p tools
-
-          cat > tools/smali_split_fix.py <<'PY'
-          #!/usr/bin/env python3
-          """Split .smali files that contain multiple '.class' directives."""
-          import pathlib
-          import re
-          import sys
-
-          CLASS_RE = re.compile(r"^\.class\s")
-
-          def split_file(path: pathlib.Path) -> int:
-              lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-              starts = [i for i, ln in enumerate(lines) if CLASS_RE.match(ln)]
-              if len(starts) <= 1:
-                  return 0
-
-              header = lines[: starts[0]]  # leading comments -> first class
-              created, seen = 0, set()
-              for n, s in enumerate(starts):
-                  end = starts[n + 1] if n + 1 < len(starts) else len(lines)
-                  block = lines[s:end]
-                  if n == 0 and header:
-                      block = header + block
-                  descriptor = lines[s].split()[-1].rstrip(";")
-                  if not descriptor.startswith("L"):
-                      print(f"!! unparseable .class line in {path}:{s+1}", file=sys.stderr)
-                      continue
-                  rel = descriptor[1:] + ".smali"  # Lcom/foo/Bar; -> com/foo/Bar.smali
-                  if rel in seen:
-                      print(f"!! duplicate class {descriptor} in {path} - keeping first", file=sys.stderr)
-                      continue
-                  seen.add(rel)
-                  out = path.parent / rel
-                  out.parent.mkdir(parents=True, exist_ok=True)
-                  out.write_text("".join(block), encoding="utf-8")
-                  created += 1
-
-              path.unlink()  # merged original is invalid once split
-              print(f"split: {path} -> {created} class file(s)")
-              return created
-
-          def main() -> int:
-              roots = [pathlib.Path(p) for p in sys.argv[1:]] or [pathlib.Path("app")]
-              total = 0
-              for root in roots:
-                  for smali in sorted(root.rglob("*.smali")):
-                      try:
-                          total += split_file(smali)
-                      except Exception as exc:
-                          print(f"!! {smali}: {exc}", file=sys.stderr)
-              print(f"total classes extracted: {total}")
-              return 1 if total else 0
-
-          if __name__ == "__main__":
-              sys.exit(main())
-          PY
-          chmod +x tools/smali_split_fix.py
-
-          echo "Scanning smali sources for duplicate '.class' directives..."
-          set +e
-          python3 tools/smali_split_fix.py app
-          split_status=$?
-          set -e
-          if [ "$split_status" -ne 0 ]; then
-            echo "Merged smali files were split (see above)."
-          else
-            echo "No merged smali files found."
-          fi
-
-          echo "Validating that every remaining .smali holds exactly one class..."
-          python3 <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          bad = []
-          for p in pathlib.Path("app").rglob("*.smali"):
-              try:
-                  with open(p, encoding="utf-8", errors="replace") as fh:
-                      n = sum(1 for ln in fh if re.match(r"^\.class\s", ln))
-              except Exception:
-                  continue
-              if n > 1:
-                  bad.append(str(p))
-
-          if bad:
-              print("::error::Still-merged smali files:")
-              for b in bad:
-                  print(f"  - {b}")
-              sys.exit(1)
-          print("All smali files contain exactly one class.")
-          PY
-
-      # ============================================================
-      # 11. NORMALIZE APKTOOL METADATA
+      # 10. NORMALIZE APKTOOL METADATA
       # ============================================================
       - name: Normalize Apktool metadata
         shell: bash
@@ -403,7 +287,7 @@ jobs:
             app/apktool.yml || true
 
       # ============================================================
-      # 12. BOOTSTRAP APKTOOL 3.0.3
+      # 11. BOOTSTRAP APKTOOL 3.0.3
       # ============================================================
       - name: Bootstrap Apktool 3.0.3
         shell: bash
@@ -436,7 +320,7 @@ jobs:
           java -jar tools/apktool.jar --version
 
       # ============================================================
-      # 13. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
+      # 12. PRUNE ORPHANED PUBLIC.XML RESOURCE DECLARATIONS
       # ============================================================
       - name: Prune orphaned public.xml declarations
         shell: bash
@@ -518,7 +402,7 @@ jobs:
           PY
 
       # ============================================================
-      # 14. WRITE SHARED AAPT2 RAW-VALUE SYMBOL RESOLVER
+      # 13. WRITE SHARED AAPT2 RAW-VALUE SYMBOL RESOLVER
       # ============================================================
       - name: Write shared AAPT2 symbol resolver
         shell: bash
@@ -882,7 +766,7 @@ jobs:
           echo "Shared resolver written to tools/aapt_symbol_fix.py"
 
       # ============================================================
-      # 15. PROACTIVE RAW-VALUE REPAIR PASS
+      # 14. PROACTIVE RAW-VALUE REPAIR PASS
       # ============================================================
       - name: Repair raw AAPT2 symbolic attribute values
         shell: bash
@@ -894,7 +778,7 @@ jobs:
           python3 tools/aapt_symbol_fix.py --scan-all
 
       # ============================================================
-      # 16. REPAIR MALFORMED 9-PATCH RESOURCES
+      # 15. REPAIR MALFORMED 9-PATCH RESOURCES
       # ============================================================
       - name: Repair malformed 9-patch resources
         shell: bash
@@ -1068,7 +952,12 @@ jobs:
           PY
 
       # ============================================================
-      # 17. VERIFY SOURCE STRUCTURE
+      # 16. VERIFY SOURCE STRUCTURE
+      #
+      # Runs on the PRISTINE extracted tree (before the smali split
+      # mutates file counts). tools/verify-source.sh has a
+      # hard-coded expected smali class count; running this after
+      # the split would trip that check.
       # ============================================================
       - name: Verify source structure
         shell: bash
@@ -1078,6 +967,121 @@ jobs:
           cd "$PROJECT_DIR"
 
           ./tools/verify-source.sh
+
+      # ============================================================
+      # 17. REPAIR MERGED SMALI SOURCES
+      #
+      # Some decompiled .smali files contain TWO OR MORE concatenated
+      # classes (several '.class' directives). Smali then aborts with
+      # "missing EOF at '.class'" and the whole build fails. This
+      # step splits every multi-class file into one file per class,
+      # then re-validates that no merged file remains.
+      #
+      # NOTE: this step INCREASES the .smali file count, which is
+      # why it runs AFTER "Verify source structure" (step 16).
+      # ============================================================
+      - name: Repair merged smali sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          mkdir -p tools
+
+          cat > tools/smali_split_fix.py <<'PY'
+          #!/usr/bin/env python3
+          """Split .smali files that contain multiple '.class' directives."""
+          import pathlib
+          import re
+          import sys
+
+          CLASS_RE = re.compile(r"^\.class\s")
+
+          def split_file(path: pathlib.Path) -> int:
+              lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+              starts = [i for i, ln in enumerate(lines) if CLASS_RE.match(ln)]
+              if len(starts) <= 1:
+                  return 0
+
+              header = lines[: starts[0]]  # leading comments -> first class
+              created, seen = 0, set()
+              for n, s in enumerate(starts):
+                  end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+                  block = lines[s:end]
+                  if n == 0 and header:
+                      block = header + block
+                  descriptor = lines[s].split()[-1].rstrip(";")
+                  if not descriptor.startswith("L"):
+                      print(f"!! unparseable .class line in {path}:{s+1}", file=sys.stderr)
+                      continue
+                  rel = descriptor[1:] + ".smali"  # Lcom/foo/Bar; -> com/foo/Bar.smali
+                  if rel in seen:
+                      print(f"!! duplicate class {descriptor} in {path} - keeping first", file=sys.stderr)
+                      continue
+                  seen.add(rel)
+                  out = path.parent / rel
+                  out.parent.mkdir(parents=True, exist_ok=True)
+                  out.write_text("".join(block), encoding="utf-8")
+                  created += 1
+
+              path.unlink()  # merged original is invalid once split
+              print(f"split: {path} -> {created} class file(s)")
+              return created
+
+          def main() -> int:
+              roots = [pathlib.Path(p) for p in sys.argv[1:]] or [pathlib.Path("app")]
+              total = 0
+              for root in roots:
+                  for smali in sorted(root.rglob("*.smali")):
+                      try:
+                          total += split_file(smali)
+                      except Exception as exc:
+                          print(f"!! {smali}: {exc}", file=sys.stderr)
+              print(f"total classes extracted: {total}")
+              return 1 if total else 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          chmod +x tools/smali_split_fix.py
+
+          echo "Scanning smali sources for duplicate '.class' directives..."
+          set +e
+          python3 tools/smali_split_fix.py app
+          split_status=$?
+          set -e
+          if [ "$split_status" -ne 0 ]; then
+            echo "Merged smali files were split (see above)."
+          else
+            echo "No merged smali files found."
+          fi
+
+          echo "Validating that every remaining .smali holds exactly one class..."
+          python3 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          bad = []
+          for p in pathlib.Path("app").rglob("*.smali"):
+              try:
+                  with open(p, encoding="utf-8", errors="replace") as fh:
+                      n = sum(1 for ln in fh if re.match(r"^\.class\s", ln))
+              except Exception:
+                  continue
+              if n > 1:
+                  bad.append(str(p))
+
+          if bad:
+              print("::error::Still-merged smali files:")
+              for b in bad:
+                  print(f"  - {b}")
+              sys.exit(1)
+          print("All smali files contain exactly one class.")
+          PY
+
+          echo "Smali class count (post-split):"
+          find app -path '*/smali*' -type f -name '*.smali' | wc -l
 
       # ============================================================
       # 18. SHOW GRADLE VERSION
@@ -1094,14 +1098,6 @@ jobs:
 
       # ============================================================
       # 19. BUILD UNSIGNED APK (SELF-HEALING)
-      #
-      # Apktool 3.x has no AAPT1 fallback; AAPT2 rejects raw
-      # flags/enum/dimension-enum values. Step 15 pre-fixes
-      # everything the pipeline knows about. This loop is the
-      # safety net: on failure it feeds the AAPT2 error log into
-      # aapt_symbol_fix.py AND re-splits any merged smali files,
-      # then retries. It aborts early only when NEITHER repair
-      # changed anything.
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -1284,9 +1280,6 @@ jobs:
 
       # ============================================================
       # 24. UPLOAD BUILD LOGS ON FAILURE
-      #
-      # Preserves per-attempt Gradle logs (build_attempt_N.log) so
-      # you never need to re-download the whole job log again.
       # ============================================================
       - name: Upload build logs on failure
         if: failure()
