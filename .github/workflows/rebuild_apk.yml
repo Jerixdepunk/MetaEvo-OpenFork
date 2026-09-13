@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. CHECK ZIP PARTS (resilient SHA-256)
+      # 2. CHECK ZIP PARTS
       # ============================================================
       - name: Check ZIP parts
         shell: bash
@@ -533,19 +533,21 @@ jobs:
 
 
           def decode_break_strategy(value):
-              return {0: "simple", 1: "highQuality", 2: "balanced"}.get(value)
+              return {0: "simple", 1: "high_quality", 2: "balanced"}.get(value)
 
 
           def decode_hyphenation_frequency(value):
-              return {0: "none", 1: "normal", 2: "full", 3: "normalFast", 4: "fullFast"}.get(value)
+              return {0: "none", 1: "normal", 2: "full"}.get(value)
 
 
           DISPLAY_OPTIONS_FLAGS = {
-              0x1: "showSearchIcon", 0x2: "showSearchLabel",
-              0x4: "showSearchHint", 0x8: "showSearchSuggestion",
+              0x1: "useLogo", 0x2: "showHome", 0x4: "homeAsUp",
+              0x8: "showTitle", 0x10: "showCustom", 0x20: "disableHome",
           }
 
           def decode_display_options(value):
+              if value == 0:
+                  return "none"
               parts = []
               remaining = value
               for bit in sorted(DISPLAY_OPTIONS_FLAGS.keys()):
@@ -682,32 +684,73 @@ jobs:
                     f"symbolized {total_fixed}.")
 
 
-          LOG_LINE_RE = re.compile(
+          # Numeric value rejected: try to symbolize.
+          LOG_NUMERIC_RE = re.compile(
               r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
               r'expected\s+(?P<category>flags|enum|dimension enum)\s+'
               r'but got \(raw string\)\s+(?P<value>-?0[xX][0-9a-fA-F]+|-?[0-9]+)'
           )
 
+          # Symbolic value rejected: our own previous replacement was wrong -> drop.
+          LOG_SYMBOLIC_RE = re.compile(
+              r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
+              r'expected\s+(?P<category>flags|enum|dimension enum)\s+'
+              r'but got \(raw string\)\s+(?P<value>[A-Za-z_][A-Za-z0-9_|]*)\.?\s*$'
+          )
+
+
+          def _find_item_span(lines, idx):
+              """Return (start, end) line indices of the <item> element containing idx."""
+              start = None
+              for i in range(idx, -1, -1):
+                  if '<item' in lines[i]:
+                      start = i
+                      break
+              if start is None:
+                  return None
+              end = start
+              if '</item>' not in lines[start]:
+                  for j in range(start + 1, min(start + 20, len(lines))):
+                      end = j
+                      if '</item>' in lines[j]:
+                          break
+              return (start, end)
+
 
           def fix_from_log(log_path):
               text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
-              matches = []
+
+              numeric_matches = []
+              symbolic_matches = []
               for line in text.splitlines():
-                  m = LOG_LINE_RE.search(line)
-                  if m:
-                      matches.append(m.groupdict())
-              if not matches:
+                  m1 = LOG_NUMERIC_RE.search(line)
+                  if m1:
+                      numeric_matches.append(m1.groupdict())
+                      continue
+                  m2 = LOG_SYMBOLIC_RE.search(line)
+                  if m2:
+                      symbolic_matches.append(m2.groupdict())
+
+              if not numeric_matches and not symbolic_matches:
                   print("No AAPT2 raw-value errors found in log.")
                   return 0
-              by_file = {}
-              for m in matches:
-                  by_file.setdefault(m["file"], []).append(m)
+
+              by_file_numeric = {}
+              for m in numeric_matches:
+                  by_file_numeric.setdefault(m["file"], []).append(m)
+
+              by_file_symbolic = {}
+              for m in symbolic_matches:
+                  by_file_symbolic.setdefault(m["file"], []).append(m)
+
               total_fixed = 0
               total_dropped = 0
-              for file_path, entries in by_file.items():
+
+              # 1) Numeric failures: symbolize via resolver, else drop the item line.
+              for file_path, entries in by_file_numeric.items():
                   p = Path(file_path)
                   if not p.is_file():
-                      print(f"::warning::Could not locate {file_path} reported by AAPT2; skipping.")
+                      print(f"::warning::Could not locate {file_path}; skipping.")
                       continue
                   lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
                   entries.sort(key=lambda e: int(e["line"]), reverse=True)
@@ -717,18 +760,14 @@ jobs:
                           continue
                       line_text = lines[idx]
                       name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
-                      if not name_match:
-                          print(f"::warning::Could not find attribute name at "
-                                f"{file_path}:{entry['line']}; leaving untouched.")
-                          continue
-                      attr_name = name_match.group(1)
+                      attr_name = name_match.group(1) if name_match else None
                       category_key = entry["category"].replace(" ", "_")
                       try:
                           value = parse_raw_value(entry["value"])
                       except ValueError:
                           value = None
                       symbol = None
-                      if value is not None:
+                      if attr_name and value is not None:
                           symbol = resolve_symbol(attr_name, category_key, value)
                       if symbol is not None:
                           new_line, n = re.subn(re.escape(entry["value"]), symbol, line_text, count=1)
@@ -738,13 +777,36 @@ jobs:
                               print(f"FIXED {file_path}:{entry['line']}  "
                                     f"{attr_name}: {entry['value']} -> {symbol}")
                               continue
-                      print(f"::warning::DROPPED unresolvable {entry['category']} value "
+                      print(f"::warning::DROPPED numeric {entry['category']} value "
                             f"at {file_path}:{entry['line']} "
-                            f"({attr_name} = {entry['value']}); "
-                            f"no symbolic mapping available, style override removed.")
+                            f"({attr_name} = {entry['value']})")
                       lines[idx] = ""
                       total_dropped += 1
                   p.write_text("".join(lines), encoding="utf-8")
+
+              # 2) Symbolic failures: our replacement was wrong; drop the <item>.
+              for file_path, entries in by_file_symbolic.items():
+                  p = Path(file_path)
+                  if not p.is_file():
+                      print(f"::warning::Could not locate {file_path}; skipping.")
+                      continue
+                  lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+                  spans = []
+                  for entry in entries:
+                      idx = int(entry["line"]) - 1
+                      span = _find_item_span(lines, idx)
+                      if span:
+                          spans.append((span, entry))
+                  spans.sort(key=lambda s: s[0][0], reverse=True)
+                  for (start, end), entry in spans:
+                      print(f"::warning::DROPPED item with invalid symbolic value "
+                            f"at {file_path}:{entry['line']} "
+                            f"(value '{entry['value']}' rejected by AAPT2)")
+                      for k in range(start, end + 1):
+                          lines[k] = ""
+                      total_dropped += 1
+                  p.write_text("".join(lines), encoding="utf-8")
+
               print(f"Targeted log-driven fix: {total_fixed} symbolized, "
                     f"{total_dropped} dropped.")
               return total_fixed + total_dropped
@@ -833,7 +895,7 @@ jobs:
                                   lines[i] = f'.locals {new_val}\n'
                                   total_fixed += 1
                                   modified = True
-                                  print(f"FIXED {file_path}: .locals {current} -> {new_val} (line {i+1})")
+                                  print(f"FIXED {file_path}: .locals {current} -> {new_val}")
                               found = True
                               break
                           if registers_m:
@@ -843,7 +905,7 @@ jobs:
                                   lines[i] = f'.registers {new_val}\n'
                                   total_fixed += 1
                                   modified = True
-                                  print(f"FIXED {file_path}: .registers {current} -> {new_val} (line {i+1})")
+                                  print(f"FIXED {file_path}: .registers {current} -> {new_val}")
                               found = True
                               break
                       if not found:
@@ -1046,10 +1108,6 @@ jobs:
           def is_black_marker(px):
               r, g, b, a = px
               return a == 255 and r == 0 and g == 0 and b == 0
-
-          def is_red_marker(px):
-              r, g, b, a = px
-              return a == 255 and r == 255 and g == 0 and b == 0
 
           def validate_ninepatch(path):
               try:
@@ -1333,7 +1391,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/MetaEvo-OpenFork-aligned.apk"
 
       # ============================================================
-      # 23. SIGN APK (ephemeral debug keystore)
+      # 23. SIGN APK
       # ============================================================
       - name: Sign APK (ephemeral debug keystore)
         shell: bash
