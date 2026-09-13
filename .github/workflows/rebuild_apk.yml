@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. CHECK ZIP PARTS
+      # 2. CHECK ZIP PARTS (resilient SHA-256)
       # ============================================================
       - name: Check ZIP parts
         shell: bash
@@ -177,7 +177,7 @@ jobs:
       # 7. ANDROID SDK
       # ============================================================
       - name: Set up Android SDK
-        uses: actions/setup-android@v3
+        uses: android-actions/setup-android@v3
 
       # ============================================================
       # 8. ANDROID BUILD TOOLS
@@ -335,8 +335,9 @@ jobs:
 
           res = Path("app/res")
           public_xml_path = res / "values" / "public.xml"
+
           if not public_xml_path.exists():
-              print("public.xml not found; nothing to prune.")
+              print("public.xml not found; skipping prune.")
               raise SystemExit(0)
 
           text = public_xml_path.read_text(encoding="utf-8")
@@ -346,7 +347,6 @@ jobs:
           name_tag_re = re.compile(r'<([\w.-]+)\b([^>]*)/?>')
           attr_pair_re = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
 
-          # 1. Every name= declared anywhere inside any values/*.xml file
           for xml_file in res.rglob("*.xml"):
               if xml_file == public_xml_path:
                   continue
@@ -367,7 +367,6 @@ jobs:
                   else:
                       declared.add((tag, name))
 
-          # 2. Every file inside a non-values resource directory
           for entry in res.iterdir():
               if not entry.is_dir():
                   continue
@@ -407,11 +406,6 @@ jobs:
 
       # ============================================================
       # 13. WRITE SHARED AAPT2 SYMBOL RESOLVER
-      #
-      # Now includes mappings for:
-      #   screenOrientation, configChanges, scaleType,
-      #   windowLayoutInDisplayCutoutMode, breakStrategy,
-      #   hyphenationFrequency, displayOptions.
       # ============================================================
       - name: Write shared AAPT2 symbol resolver
         shell: bash
@@ -423,18 +417,7 @@ jobs:
 
           cat > tools/aapt_symbol_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Shared AAPT2 raw-value -> symbolic-value resolver.
-
-          Modes:
-            --scan-all              Walk every app/res/**/*.xml and symbolize any
-                                     recognized raw flags/enum/dimension-enum item.
-
-            --fix-from-log LOGFILE  Parse an AAPT2 build log for
-                                     "expected (flags|enum|dimension enum) but got
-                                     (raw string) VALUE" errors, and fix exactly the
-                                     reported file:line. If the attribute is not
-                                     recognized, the offending line is dropped.
-          """
+          """Shared AAPT2 raw-value -> symbolic-value resolver."""
           import argparse
           import re
           import sys
@@ -442,30 +425,21 @@ jobs:
 
           RES_ROOT = Path("app/res")
 
-          # ---------------------------------------------------------------
-          # Decoders
-          # ---------------------------------------------------------------
-
           def decode_gravity(value):
               RELATIVE = 0x800000
               relative = bool(value & RELATIVE)
               v = value & ~RELATIVE
-
               EXACT = {0x11: "center", 0x77: "fill"}
               VMASK = {0x70: "fill_vertical", 0x50: "bottom", 0x30: "top", 0x10: "center_vertical"}
               HMASK = {0x07: "fill_horizontal", 0x05: "right", 0x03: "left", 0x01: "center_horizontal"}
-
               if v in EXACT and not relative:
                   return EXACT[v]
-
               parts = []
               remaining = v
-
               vmask = v & 0x70
               if vmask in VMASK:
                   parts.append(VMASK[vmask])
                   remaining &= ~0x70
-
               hmask = v & 0x07
               if hmask in HMASK:
                   name = HMASK[hmask]
@@ -473,14 +447,12 @@ jobs:
                       name = {"left": "start", "right": "end"}.get(name, name)
                   parts.append(name)
                   remaining &= ~0x07
-
               if v & 0x80:
                   parts.append("clip_vertical")
                   remaining &= ~0x80
               if v & 0x08:
                   parts.append("clip_horizontal")
                   remaining &= ~0x08
-
               if remaining != 0 or not parts:
                   return None
               return "|".join(parts)
@@ -489,25 +461,16 @@ jobs:
           def decode_window_soft_input_mode(value):
               if value < 0 or value & ~0xFF:
                   return None
-
-              STATE = {
-                  0: "stateUnspecified", 1: "stateUnchanged", 2: "stateHidden",
-                  3: "stateAlwaysHidden", 4: "stateVisible", 5: "stateAlwaysVisible",
-              }
-              ADJUST = {
-                  0x00: "adjustUnspecified", 0x10: "adjustResize",
-                  0x20: "adjustPan", 0x30: "adjustNothing",
-              }
-
+              STATE = {0: "stateUnspecified", 1: "stateUnchanged", 2: "stateHidden",
+                       3: "stateAlwaysHidden", 4: "stateVisible", 5: "stateAlwaysVisible"}
+              ADJUST = {0x00: "adjustUnspecified", 0x10: "adjustResize",
+                        0x20: "adjustPan", 0x30: "adjustNothing"}
               state_bits = value & 0x0F
               adjust_bits = value & 0xF0
-
               if state_bits not in STATE or adjust_bits not in ADJUST:
                   return None
-
               if value == 0:
                   return "stateUnspecified"
-
               parts = []
               if state_bits != 0:
                   parts.append(STATE[state_bits])
@@ -533,13 +496,11 @@ jobs:
 
 
           def decode_screen_orientation(value):
-              return {
-                  0: "landscape", 1: "portrait", 2: "user", 3: "behind",
-                  4: "sensor", 5: "nosensor", 6: "sensorLandscape",
-                  7: "sensorPortrait", 8: "reverseLandscape",
-                  9: "reversePortrait", 10: "fullSensor", 11: "userLandscape",
-                  12: "userPortrait", 13: "fullUser", 14: "locked",
-              }.get(value)
+              return {0: "landscape", 1: "portrait", 2: "user", 3: "behind",
+                      4: "sensor", 5: "nosensor", 6: "sensorLandscape",
+                      7: "sensorPortrait", 8: "reverseLandscape",
+                      9: "reversePortrait", 10: "fullSensor", 11: "userLandscape",
+                      12: "userPortrait", 13: "fullUser", 14: "locked"}.get(value)
 
 
           CONFIG_CHANGE_FLAGS = {
@@ -547,8 +508,7 @@ jobs:
               0x0008: "touchscreen", 0x0010: "keyboard", 0x0020: "keyboardHidden",
               0x0040: "navigation", 0x0080: "orientation", 0x0100: "screenLayout",
               0x0200: "uiMode", 0x0400: "screenSize", 0x0800: "smallestScreenSize",
-              0x1000: "density", 0x2000: "layoutDirection",
-              0x40000000: "fontScale",
+              0x1000: "density", 0x2000: "layoutDirection", 0x40000000: "fontScale",
           }
 
           def decode_config_changes(value):
@@ -564,16 +524,12 @@ jobs:
 
 
           def decode_scale_type(value):
-              return {
-                  0: "matrix", 1: "fitXY", 2: "fitStart", 3: "fitCenter",
-                  4: "fitEnd", 5: "center", 6: "centerCrop", 7: "centerInside",
-              }.get(value)
+              return {0: "matrix", 1: "fitXY", 2: "fitStart", 3: "fitCenter",
+                      4: "fitEnd", 5: "center", 6: "centerCrop", 7: "centerInside"}.get(value)
 
 
           def decode_window_layout_in_display_cutout_mode(value):
-              return {
-                  0: "default", 1: "shortEdges", 2: "never", 3: "always",
-              }.get(value)
+              return {0: "default", 1: "shortEdges", 2: "never", 3: "always"}.get(value)
 
 
           def decode_break_strategy(value):
@@ -619,24 +575,15 @@ jobs:
           ENUM_TABLES = {
               "orientation": {0: "horizontal", 1: "vertical"},
               "visibility": {0: "visible", 1: "invisible", 2: "gone"},
-              "textAlignment": {
-                  0: "inherit", 1: "gravity", 2: "textStart", 3: "textEnd",
-                  4: "center", 5: "viewStart", 6: "viewEnd",
-              },
+              "textAlignment": {0: "inherit", 1: "gravity", 2: "textStart",
+                                3: "textEnd", 4: "center", 5: "viewStart", 6: "viewEnd"},
               "layoutDirection": {0: "ltr", 1: "rtl", 2: "locale", 3: "inherit"},
               "typeface": {0: "normal", 1: "sans", 2: "serif", 3: "monospace"},
               "ellipsize": {0: "none", 1: "start", 2: "middle", 3: "end", 4: "marquee"},
               "capitalize": {0: "none", 1: "sentences", 2: "words", 3: "characters"},
-              "imeOptions": {
-                  0: "actionUnspecified", 1: "actionNone", 2: "actionGo",
-                  3: "actionSearch", 4: "actionSend", 5: "actionNext",
-                  6: "actionDone", 7: "actionPrevious",
-              },
-              "screenOrientation": None,  # handled via decoder
-              "scaleType": None,
-              "windowLayoutInDisplayCutoutMode": None,
-              "breakStrategy": None,
-              "hyphenationFrequency": None,
+              "imeOptions": {0: "actionUnspecified", 1: "actionNone", 2: "actionGo",
+                             3: "actionSearch", 4: "actionSend", 5: "actionNext",
+                             6: "actionDone", 7: "actionPrevious"},
           }
 
 
@@ -651,20 +598,16 @@ jobs:
 
 
           def resolve_symbol(attr_name, category, value):
-              """category is one of: flags, enum, dimension_enum"""
               short_name = attr_name.split(":")[-1]
-
               if category == "dimension_enum":
                   if short_name in DIMENSION_ENUM_ATTRS:
                       return decode_dimension_enum(value)
                   return None
-
               if category == "flags":
                   decoder = FLAG_DECODERS.get(short_name)
                   if decoder:
                       return decoder(value)
                   return None
-
               if category == "enum":
                   if short_name == "screenOrientation":
                       return decode_screen_orientation(value)
@@ -680,7 +623,6 @@ jobs:
                   if table:
                       return table.get(value)
                   return None
-
               return None
 
 
@@ -690,22 +632,15 @@ jobs:
           )
 
 
-          # ---------------------------------------------------------------
-          # Mode 1: proactive full-tree scan
-          # ---------------------------------------------------------------
-
           def scan_all():
               total_fixed = 0
               total_seen = 0
-
               for xml_file in RES_ROOT.rglob("*.xml"):
                   try:
                       text = xml_file.read_text(encoding="utf-8")
                   except Exception:
                       continue
-
                   fixed_here = []
-
                   def repl(m):
                       nonlocal total_seen
                       open_tag, attr_name, raw_value, close_tag = m.groups()
@@ -714,10 +649,8 @@ jobs:
                           value = parse_raw_value(raw_value)
                       except ValueError:
                           return m.group(0)
-
                       short_name = attr_name.split(":")[-1]
                       symbol = None
-
                       if short_name in DIMENSION_ENUM_ATTRS:
                           symbol = decode_dimension_enum(value)
                       elif short_name in FLAG_DECODERS:
@@ -734,29 +667,20 @@ jobs:
                           symbol = decode_hyphenation_frequency(value)
                       elif short_name in ENUM_TABLES:
                           symbol = ENUM_TABLES[short_name].get(value)
-
                       if symbol is None:
                           return m.group(0)
-
                       fixed_here.append(f"{attr_name}: {raw_value} -> {symbol}")
                       return f"{open_tag}{symbol}{close_tag}"
-
                   new_text = ITEM_RE.sub(repl, text)
-
                   if fixed_here:
                       xml_file.write_text(new_text, encoding="utf-8")
                       total_fixed += len(fixed_here)
                       print(f"{xml_file.relative_to(RES_ROOT)}:")
                       for line in fixed_here:
                           print("  -", line)
-
               print(f"Proactive scan: inspected {total_seen} raw-valued items, "
                     f"symbolized {total_fixed}.")
 
-
-          # ---------------------------------------------------------------
-          # Mode 2: targeted fix driven by an AAPT2 error log
-          # ---------------------------------------------------------------
 
           LOG_LINE_RE = re.compile(
               r'^(?:W:\s*)?(?P<file>\S+\.xml):(?P<line>\d+):\s*error:\s*'
@@ -767,78 +691,60 @@ jobs:
 
           def fix_from_log(log_path):
               text = Path(log_path).read_text(encoding="utf-8", errors="ignore")
-
               matches = []
               for line in text.splitlines():
                   m = LOG_LINE_RE.search(line)
                   if m:
                       matches.append(m.groupdict())
-
               if not matches:
                   print("No AAPT2 raw-value errors found in log.")
                   return 0
-
               by_file = {}
               for m in matches:
                   by_file.setdefault(m["file"], []).append(m)
-
               total_fixed = 0
               total_dropped = 0
-
               for file_path, entries in by_file.items():
                   p = Path(file_path)
                   if not p.is_file():
                       print(f"::warning::Could not locate {file_path} reported by AAPT2; skipping.")
                       continue
-
                   lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
-
                   entries.sort(key=lambda e: int(e["line"]), reverse=True)
-
                   for entry in entries:
                       idx = int(entry["line"]) - 1
                       if idx < 0 or idx >= len(lines):
                           continue
-
                       line_text = lines[idx]
                       name_match = re.search(r'name="((?:android:)?[\w.]+)"', line_text)
                       if not name_match:
                           print(f"::warning::Could not find attribute name at "
                                 f"{file_path}:{entry['line']}; leaving untouched.")
                           continue
-
                       attr_name = name_match.group(1)
                       category_key = entry["category"].replace(" ", "_")
-
                       try:
                           value = parse_raw_value(entry["value"])
                       except ValueError:
                           value = None
-
                       symbol = None
                       if value is not None:
                           symbol = resolve_symbol(attr_name, category_key, value)
-
                       if symbol is not None:
-                          new_line, n = re.subn(
-                              re.escape(entry["value"]), symbol, line_text, count=1
-                          )
+                          new_line, n = re.subn(re.escape(entry["value"]), symbol, line_text, count=1)
                           if n:
                               lines[idx] = new_line
                               total_fixed += 1
                               print(f"FIXED {file_path}:{entry['line']}  "
                                     f"{attr_name}: {entry['value']} -> {symbol}")
                               continue
-
                       print(f"::warning::DROPPED unresolvable {entry['category']} value "
                             f"at {file_path}:{entry['line']} "
                             f"({attr_name} = {entry['value']}); "
                             f"no symbolic mapping available, style override removed.")
                       lines[idx] = ""
                       total_dropped += 1
-
                   p.write_text("".join(lines), encoding="utf-8")
-
               print(f"Targeted log-driven fix: {total_fixed} symbolized, "
                     f"{total_dropped} dropped.")
               return total_fixed + total_dropped
@@ -849,13 +755,12 @@ jobs:
               parser.add_argument("--scan-all", action="store_true")
               parser.add_argument("--fix-from-log")
               args = parser.parse_args()
-
               if args.scan_all:
                   scan_all()
               elif args.fix_from_log:
                   changed = fix_from_log(args.fix_from_log)
                   if changed == 0:
-                      sys.exit(2)  # signal "nothing to fix" to the caller
+                      sys.exit(2)
               else:
                   parser.error("Specify --scan-all or --fix-from-log LOGFILE")
 
@@ -879,13 +784,7 @@ jobs:
 
           cat > tools/smali_register_fix.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Fix smali register errors from a Gradle/Apktool build log.
-
-          Parses lines like:
-          app/smali_classes5/.../oOO00OO0Oo0.smali[298,4] This method requires at least 2 registers, for the method parameters
-
-          and increases the .locals (or .registers) directive in that method.
-          """
+          """Fix smali register errors from a Gradle/Apktool build log."""
           import re
           import sys
           from pathlib import Path
@@ -906,15 +805,12 @@ jobs:
                   m = LOG_RE.search(line)
                   if m:
                       matches.append(m.groupdict())
-
               if not matches:
                   print("No smali register errors found in log.")
                   return 0
-
               by_file = {}
               for m in matches:
                   by_file.setdefault(m['file'], []).append(m)
-
               total_fixed = 0
               for file_path, entries in by_file.items():
                   p = Path(file_path)
@@ -926,6 +822,7 @@ jobs:
                   for entry in entries:
                       line_idx = int(entry['line']) - 1
                       needed = int(entry['needed'])
+                      found = False
                       for i in range(line_idx, -1, -1):
                           locals_m = LOCALS_RE.match(lines[i])
                           registers_m = REGISTERS_RE.match(lines[i])
@@ -937,6 +834,7 @@ jobs:
                                   total_fixed += 1
                                   modified = True
                                   print(f"FIXED {file_path}: .locals {current} -> {new_val} (line {i+1})")
+                              found = True
                               break
                           if registers_m:
                               current = int(registers_m.group(1))
@@ -946,8 +844,9 @@ jobs:
                                   total_fixed += 1
                                   modified = True
                                   print(f"FIXED {file_path}: .registers {current} -> {new_val} (line {i+1})")
+                              found = True
                               break
-                      else:
+                      if not found:
                           print(f"::warning::No .locals/.registers found before line {entry['line']} in {file_path}")
                   if modified:
                       p.write_text(''.join(lines), encoding='utf-8')
@@ -955,11 +854,10 @@ jobs:
 
 
           def main():
-              log_path = sys.argv[1] if len(sys.argv) > 1 else None
-              if not log_path:
+              if len(sys.argv) < 2:
                   print("Usage: smali_register_fix.py <build-log>")
-                  return 0
-              changed = fix_from_log(log_path)
+                  sys.exit(2)
+              changed = fix_from_log(sys.argv[1])
               if changed == 0:
                   sys.exit(2)
               return 0
@@ -1029,7 +927,7 @@ jobs:
           echo "Alpha attr fix written to tools/attrs_alpha_fix.py"
 
       # ============================================================
-      # 16. REPAIR RAW AAPT2 SYMBOLIC ATTRIBUTE VALUES (proactive)
+      # 16. PROACTIVE RAW-VALUE REPAIR PASS
       # ============================================================
       - name: Repair raw AAPT2 symbolic attribute values
         shell: bash
@@ -1059,22 +957,18 @@ jobs:
 
           def read_png_rgba(path):
               data = path.read_bytes()
-
               if data[:8] != b'\x89PNG\r\n\x1a\n':
                   raise ValueError("not a PNG")
-
               pos = 8
               width = height = None
               color_type = None
               bit_depth = None
               idat = bytearray()
-
               while pos < len(data):
                   length = struct.unpack(">I", data[pos:pos+4])[0]
                   ctype = data[pos+4:pos+8]
                   chunk = data[pos+8:pos+8+length]
                   pos += 12 + length
-
                   if ctype == b'IHDR':
                       width, height, bit_depth, color_type, _, _, _ = struct.unpack(
                           ">IIBBBBB", chunk
@@ -1083,37 +977,30 @@ jobs:
                       idat.extend(chunk)
                   elif ctype == b'IEND':
                       break
-
               if width is None:
                   raise ValueError("missing IHDR")
               if bit_depth != 8:
                   raise ValueError("unsupported bit depth")
-
               raw = zlib.decompress(bytes(idat))
-
               if color_type == 6:
                   channels = 4
               elif color_type == 2:
                   channels = 3
               else:
                   raise ValueError("unsupported PNG color type")
-
               stride = width * channels
               rows = []
               offset = 0
               previous = bytearray(stride)
-
               for _ in range(height):
                   filter_type = raw[offset]
                   offset += 1
                   current = bytearray(raw[offset:offset+stride])
                   offset += stride
-
                   for i in range(stride):
                       left = current[i-channels] if i >= channels else 0
                       up = previous[i]
                       up_left = previous[i-channels] if i >= channels else 0
-
                       if filter_type == 0:
                           pass
                       elif filter_type == 1:
@@ -1134,10 +1021,8 @@ jobs:
                           current[i] = (current[i] + predictor) & 255
                       else:
                           raise ValueError(f"unsupported PNG filter {filter_type}")
-
                   previous = current
                   rows.append(current)
-
               pixels = []
               for row in rows:
                   row_pixels = []
@@ -1150,7 +1035,6 @@ jobs:
                           a = 255
                       row_pixels.append((r, g, b, a))
                   pixels.append(row_pixels)
-
               return width, height, pixels
 
           def is_neutral(px):
@@ -1172,46 +1056,33 @@ jobs:
                   width, height, pixels = read_png_rgba(path)
               except Exception as e:
                   return False, f"could not validate: {e}"
-
               if width < 3 or height < 3:
                   return False, "too small to be a valid 9-patch"
-
               top_row = pixels[0]
               bottom_row = pixels[height-1]
               left_col = [pixels[y][0] for y in range(height)]
               right_col = [pixels[y][width-1] for y in range(height)]
-
               for corner in (top_row[0], top_row[-1], bottom_row[0], bottom_row[-1]):
                   if not is_neutral(corner):
                       return False, "invalid corner pixel (must be transparent)"
-
               for px in top_row[1:-1] + bottom_row[1:-1] + left_col[1:-1] + right_col[1:-1]:
                   if not (is_neutral(px) or is_black_marker(px)):
                       return False, "invalid 9-patch frame color"
-
               return True, None
 
           fixed = []
-
           for ninepatch in root.rglob("*.9.png"):
               valid, reason = validate_ninepatch(ninepatch)
               if valid:
                   continue
-
               new_path = ninepatch.with_name(ninepatch.name[:-6] + ".png")
               ninepatch.rename(new_path)
               fixed.append(f"{ninepatch.name} -> {new_path.name} ({reason})")
-
           for entry in fixed:
               print(f"REPAIRED: {entry}")
-
           remaining = list(root.rglob("*.9.png"))
           print(f"Remaining valid .9.png resources: {len(remaining)}")
           print(f"Malformed resources converted to ordinary PNG: {len(fixed)}")
-          print()
-          print("9-patch repair complete.")
-          print("Remaining .9.png resources:")
-          print(len(remaining))
           PY
 
       # ============================================================
@@ -1251,7 +1122,6 @@ jobs:
               starts = [i for i, ln in enumerate(lines) if CLASS_RE.match(ln)]
               if len(starts) <= 1:
                   return 0
-
               header = lines[: starts[0]]
               created, seen = 0, set()
               for n, s in enumerate(starts):
@@ -1272,7 +1142,6 @@ jobs:
                   out.parent.mkdir(parents=True, exist_ok=True)
                   out.write_text("".join(block), encoding="utf-8")
                   created += 1
-
               path.unlink()
               print(f"split: {path} -> {created} class file(s)")
               return created
@@ -1347,13 +1216,6 @@ jobs:
 
       # ============================================================
       # 21. BUILD UNSIGNED APK (SELF-HEALING)
-      #
-      # Now runs FOUR repair scripts each retry:
-      #   1. aapt_symbol_fix.py    --fix-from-log
-      #   2. smali_split_fix.py    app
-      #   3. smali_register_fix.py --fix-from-log
-      #   4. attrs_alpha_fix.py
-      # Aborts early only if NONE of them changed anything.
       # ============================================================
       - name: Build unsigned APK
         shell: bash
@@ -1397,31 +1259,26 @@ jobs:
 
             echo "Attempting automatic repair..."
 
-            # 1) AAPT2 raw enum/flags values
             set +e
             python3 tools/aapt_symbol_fix.py --fix-from-log "$LOG_FILE"
             fix_status=$?
             set -e
 
-            # 2) Merged smali files
             set +e
             python3 tools/smali_split_fix.py app
             smali_status=$?
             set -e
 
-            # 3) Smali register-too-small errors
             set +e
             python3 tools/smali_register_fix.py "$LOG_FILE"
             reg_status=$?
             set -e
 
-            # 4) Missing alpha attr
             set +e
             python3 tools/attrs_alpha_fix.py
             alpha_status=$?
             set -e
 
-            # Only give up when NEITHER repair changed anything
             if [ "$fix_status" -eq 2 ] && [ "$smali_status" -eq 0 ] && \
                [ "$reg_status" -eq 2 ] && [ "$alpha_status" -eq 0 ]; then
               echo "::error::Build failed and no known repair pattern changed anything."
